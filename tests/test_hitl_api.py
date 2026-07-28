@@ -130,6 +130,12 @@ def test_hitl_start_waiting_for_human(monkeypatch):
     assert data["current_stage"] == "story_review_completed"
     assert data["review_payload"]["type"] == "story_review_required"
     assert data["execution_trace"][0]["node"] == "review_story"
+    assert data["execution_summary"]["status"] == "waiting_for_human"
+    assert data["execution_summary"]["execution_id"] == data["execution_id"]
+    assert data["execution_summary"]["trace_event_count"] == 1
+    assert data["execution_summary"]["node_execution_counts"] == {
+        "review_story": 1,
+    }
 
 
 def test_hitl_resume_approve_completed(monkeypatch):
@@ -144,6 +150,9 @@ def test_hitl_resume_approve_completed(monkeypatch):
             return FakeGraphState(
                 values={
                     "current_stage": "story_review_completed",
+                    "execution_trace": [
+                        _trace(execution_id, "review_story")
+                    ],
                 },
                 next_nodes=("human_review_story",),
             )
@@ -204,6 +213,22 @@ def test_hitl_resume_approve_completed(monkeypatch):
         "user_idea": "生成一个校园故事",
     }
     assert data["memory_update_status"] == "skipped"
+    assert data["execution_summary"]["status"] == "completed"
+    assert data["execution_summary"]["execution_id"] == execution_id
+    assert data["execution_summary"]["memory_update_status"] == "skipped"
+    assert [
+        event["node"]
+        for event in data["execution_trace"]
+    ] == [
+        "review_story",
+        "human_review_story",
+        "finalize",
+        "update_memory",
+    ]
+    assert (
+        len(data["execution_trace"])
+        == data["execution_summary"]["trace_event_count"]
+    )
 
 
 def test_hitl_resume_revise_waiting_again(monkeypatch):
@@ -224,6 +249,9 @@ def test_hitl_resume_revise_waiting_again(monkeypatch):
                 return FakeGraphState(
                     values={
                         "current_stage": "story_review_completed",
+                        "execution_trace": [
+                            _trace(execution_id, "review_story")
+                        ],
                     },
                     next_nodes=("human_review_story",),
                 )
@@ -232,6 +260,7 @@ def test_hitl_resume_revise_waiting_again(monkeypatch):
                 values={
                     "current_stage": "story_review_completed",
                     "execution_trace": [
+                        _trace(execution_id, "review_story"),
                         _trace(execution_id, "revise_story")
                     ],
                 },
@@ -276,7 +305,233 @@ def test_hitl_resume_revise_waiting_again(monkeypatch):
     assert response.status_code == 200
     assert data["status"] == "waiting_for_human"
     assert data["review_payload"]["execution_id"] == execution_id
-    assert data["execution_trace"][0]["node"] == "revise_story"
+    assert [
+        event["node"]
+        for event in data["execution_trace"]
+    ] == [
+        "review_story",
+        "revise_story",
+    ]
+    assert data["execution_summary"]["status"] == "waiting_for_human"
+    assert data["execution_summary"]["execution_id"] == execution_id
+    assert data["execution_summary"]["node_execution_counts"] == {
+        "review_story": 1,
+        "revise_story": 1,
+    }
+    assert (
+        len(data["execution_trace"])
+        == data["execution_summary"]["trace_event_count"]
+    )
+
+
+def test_hitl_start_then_resume_returns_complete_trace(
+    monkeypatch,
+):
+    """
+    同一execution_id从Start暂停再Resume后，响应应包含暂停前后的完整有序Trace。
+    """
+
+    class StatefulFakeHitlGraph:
+        def __init__(self):
+            self.execution_id = None
+            self.values = {}
+            self.next = ()
+
+        def stream(
+            self,
+            graph_input,
+            config=None,
+            stream_mode=None,
+        ):
+            assert stream_mode == "updates"
+
+            if isinstance(graph_input, dict):
+                self.execution_id = graph_input[
+                    "execution_id"
+                ]
+                assert config["configurable"][
+                    "thread_id"
+                ] == self.execution_id
+
+                for node_name in (
+                    "retrieve_memory",
+                    "review_story",
+                ):
+                    trace_event = _trace(
+                        self.execution_id,
+                        node_name,
+                    )
+                    self.values.setdefault(
+                        "execution_trace",
+                        [],
+                    ).append(
+                        trace_event
+                    )
+                    self.values[
+                        "current_stage"
+                    ] = trace_event["stage"]
+                    yield {
+                        node_name: {
+                            "current_stage": trace_event[
+                                "stage"
+                            ],
+                            "execution_trace": [
+                                trace_event
+                            ],
+                        }
+                    }
+
+                self.next = (
+                    "human_review_story",
+                )
+                yield {
+                    "__interrupt__": [
+                        FakeInterrupt(
+                            _waiting_payload(
+                                self.execution_id
+                            )
+                        )
+                    ]
+                }
+                return
+
+            assert config["configurable"][
+                "thread_id"
+            ] == self.execution_id
+            self.next = ()
+
+            for node_name in (
+                "human_review_story",
+                "write_scenes",
+                "finalize",
+                "update_memory",
+            ):
+                trace_event = _trace(
+                    self.execution_id,
+                    node_name,
+                )
+                self.values[
+                    "execution_trace"
+                ].append(
+                    trace_event
+                )
+                self.values[
+                    "current_stage"
+                ] = trace_event["stage"]
+                node_update = {
+                    "current_stage": trace_event[
+                        "stage"
+                    ],
+                    "execution_trace": [
+                        trace_event
+                    ],
+                }
+
+                if node_name == "finalize":
+                    self.values["final_output"] = {
+                        "user_idea": "测试故事",
+                    }
+                    node_update["final_output"] = (
+                        self.values[
+                            "final_output"
+                        ]
+                    )
+
+                if node_name == "update_memory":
+                    self.values[
+                        "memory_update_status"
+                    ] = "skipped"
+                    node_update[
+                        "memory_update_status"
+                    ] = "skipped"
+
+                yield {
+                    node_name: node_update
+                }
+
+        def get_state(
+            self,
+            config,
+        ):
+            return FakeGraphState(
+                values={
+                    **self.values,
+                    "execution_trace": list(
+                        self.values.get(
+                            "execution_trace",
+                            [],
+                        )
+                    ),
+                },
+                next_nodes=self.next,
+            )
+
+    fake_graph = StatefulFakeHitlGraph()
+    monkeypatch.setattr(
+        api_main,
+        "film_hitl_graph",
+        fake_graph,
+    )
+
+    start_response = client.post(
+        "/api/v1/films/hitl/start",
+        json={
+            "user_id": "trace_test_user",
+            "user_idea": "生成一个测试故事",
+        },
+    )
+    start_data = start_response.json()
+    execution_id = start_data[
+        "execution_id"
+    ]
+
+    assert start_response.status_code == 200
+    assert start_data["status"] == "waiting_for_human"
+    assert [
+        event["node"]
+        for event in start_data["execution_trace"]
+    ] == [
+        "retrieve_memory",
+        "review_story",
+    ]
+
+    resume_response = client.post(
+        f"/api/v1/films/hitl/{execution_id}/resume",
+        json={
+            "decision": "approve",
+            "feedback": None,
+        },
+    )
+    resume_data = resume_response.json()
+    trace_nodes = [
+        event["node"]
+        for event in resume_data[
+            "execution_trace"
+        ]
+    ]
+
+    assert resume_response.status_code == 200
+    assert resume_data["status"] == "completed"
+    assert resume_data["execution_id"] == execution_id
+    assert trace_nodes == [
+        "retrieve_memory",
+        "review_story",
+        "human_review_story",
+        "write_scenes",
+        "finalize",
+        "update_memory",
+    ]
+    assert len(trace_nodes) == len(
+        set(trace_nodes)
+    )
+    assert (
+        len(resume_data["execution_trace"])
+        == resume_data[
+            "execution_summary"
+        ][
+            "trace_event_count"
+        ]
+    )
 
 
 def test_hitl_resume_revise_empty_feedback_returns_422():
@@ -381,5 +636,8 @@ def test_hitl_graph_exception_returns_500(monkeypatch):
     assert response.status_code == 500
     assert data["detail"]["execution_id"].startswith("exec_")
     assert data["detail"]["message"] == "HITL Graph执行失败。"
+    assert data["detail"]["execution_summary"]["status"] == "failed"
+    assert data["detail"]["execution_summary"]["error_type"] == "RuntimeError"
+    assert data["detail"]["execution_summary"]["error_message"] == "HITL Graph执行失败。"
     assert "internal fake graph error" not in str(data)
     assert "Traceback" not in str(data)

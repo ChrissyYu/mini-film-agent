@@ -1,13 +1,91 @@
 import json
+import re
+from typing import Literal
 
-from memory.models import MemoryUpdate, UserMemory    # MemoryUpdate是提取结果，UserMemory是当前已有记忆
-from nodes import llm    # 复用项目统一配置好的LLM客户端
+from pydantic import BaseModel, Field
+
+from llm_profiles.factory import create_structured_llm
+from memory.models import MemoryUpdate, UserMemory    # MemoryUpdate是最终增量，UserMemory是当前已有记忆
+from observability.llm_calls import invoke_structured_llm
+from prompts.models import RenderedPrompt
+from prompts.renderer import render_prompt
 
 
-# 使用项目现有LLM客户端，并通过structured output约束输出结构。
-memory_update_llm = llm.with_structured_output(
-    MemoryUpdate    # 约束LLM必须返回长期偏好增量结构
+MemoryField = Literal[
+    "preferred_genres_to_add",
+    "style_preferences_to_add",
+    "disliked_elements_to_add",
+    "preferred_duration_sec",
+    "additional_preferences_to_add",
+    "story_preferences_to_add",
+    "scene_preferences_to_add",
+]
+MemorySource = Literal[
+    "user_idea",
+    "human_feedback",
+]
+MemoryClaimType = Literal[
+    "explicit_preference",
+    "task_constraint",
+    "inferred_preference",
+]
+MemoryDecision = Literal[
+    "ACCEPT",
+    "REJECT",
+]
+
+
+class MemoryCandidate(BaseModel):
+    """
+    Memory提取内部候选。
+
+    候选只代表“可能写入”的主张，不拥有写入UserMemory的权限；
+    后续必须通过原文证据校验和保守Verifier。
+    """
+
+    field: MemoryField = Field(description="候选目标字段")
+    value: str = Field(description="规范化后的候选偏好值")
+    source: MemorySource = Field(description="候选来自用户输入还是人工反馈")
+    evidence: str = Field(description="用户原文中的直接证据")
+    claim_type: MemoryClaimType = Field(description="候选主张类型")
+
+
+class MemoryCandidateBatch(BaseModel):
+    """
+    候选提取阶段的结构化输出。
+    """
+
+    candidates: list[MemoryCandidate] = Field(default_factory=list)
+
+
+class MemoryCandidateDecisionItem(MemoryCandidate):
+    """
+    Verifier对单个候选的保守裁决。
+    """
+
+    decision: MemoryDecision = Field(description="ACCEPT或REJECT")
+
+
+class MemoryCandidateVerification(BaseModel):
+    """
+    批量Verifier结构化输出。
+    """
+
+    decisions: list[MemoryCandidateDecisionItem] = Field(default_factory=list)
+
+
+# 生产路径使用两段式structured output：候选提取 -> 保守验证。
+memory_candidate_llm = create_structured_llm(
+    "memory.candidate_extraction",
+    MemoryCandidateBatch
 )
+memory_verifier_llm = create_structured_llm(
+    "memory.conservative_verifier",
+    MemoryCandidateVerification
+)
+
+# 仅保留给旧测试monkeypatch；正常运行时不参与Memory提取。
+memory_update_llm = None
 
 
 def _format_current_memory(
@@ -33,11 +111,14 @@ def _format_current_memory(
     )
 
 
-def _format_recent_human_feedback(
+def _collect_recent_human_feedback_items(
     human_feedback_history: list[dict] | None,
-) -> str:
+) -> list[dict]:
     """
-    在代码中先过滤和截断人工反馈，避免空反馈或过长历史干扰Memory提取。
+    提取有效人工反馈事件。
+
+    approve但没有文字反馈、空字符串反馈都不作为Memory来源；
+    有文字的人工反馈保留给LLM判断是否具有跨任务复用价值。
     """
     human_feedback_items = []
 
@@ -63,8 +144,15 @@ def _format_recent_human_feedback(
         )
 
     # 只取最近8条用户反馈，避免长对话把Prompt撑大，也降低一次性细节被反复放大的风险。
-    recent_human_feedback_items = human_feedback_items[-8:]
+    return human_feedback_items[-8:]
 
+
+def _format_recent_human_feedback_items(
+    recent_human_feedback_items: list[dict],
+) -> str:
+    """
+    将已过滤的人工反馈格式化给LLM。
+    """
     return (
         json.dumps(
             recent_human_feedback_items,
@@ -172,77 +260,380 @@ def _normalize_memory_update(
     return normalized_update
 
 
+def _source_texts_for_candidate(
+    candidate: MemoryCandidate,
+    user_idea: str,
+    recent_human_feedback_items: list[dict],
+) -> list[str]:
+    """
+    根据候选source找到可验证的原始文本集合。
+    """
+    if candidate.source == "user_idea":
+        return [
+            user_idea or "",
+        ]
+
+    return [
+        feedback_item["feedback"]
+        for feedback_item in recent_human_feedback_items
+    ]
+
+
+def _candidate_has_valid_evidence(
+    candidate: MemoryCandidate,
+    user_idea: str,
+    recent_human_feedback_items: list[dict],
+) -> bool:
+    """
+    确定性证据校验：evidence必须非空，并且必须逐字出现在对应source原文中。
+
+    这里不判断“校园/地点/人物”等实体类型，只验证候选是否真的有用户原文证据；
+    内容是否足以成为长期偏好交给后续保守Verifier。
+    """
+    evidence = candidate.evidence.strip()
+
+    if not evidence:
+        return False
+
+    return any(
+        evidence in source_text
+        for source_text in _source_texts_for_candidate(
+            candidate,
+            user_idea,
+            recent_human_feedback_items,
+        )
+    )
+
+
+def _candidate_key(
+    candidate: MemoryCandidate,
+) -> tuple[str, str, str, str, str]:
+    """
+    生成候选身份键，避免Verifier凭空新增未验证候选。
+    """
+    return (
+        candidate.field,
+        candidate.value.strip(),
+        candidate.source,
+        candidate.evidence.strip(),
+        candidate.claim_type,
+    )
+
+
+def _filter_candidates_with_evidence(
+    candidates: list[MemoryCandidate],
+    user_idea: str,
+    recent_human_feedback_items: list[dict],
+) -> list[MemoryCandidate]:
+    """
+    过滤掉缺少原文证据或证据无法在source中定位的候选。
+    """
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.value.strip()
+        and _candidate_has_valid_evidence(
+            candidate,
+            user_idea,
+            recent_human_feedback_items,
+        )
+    ]
+
+
+def _candidate_batch_to_json(
+    candidates: list[MemoryCandidate],
+) -> str:
+    """
+    将候选转换成JSON文本，供Verifier批量判断。
+    """
+    return json.dumps(
+        [
+            candidate.model_dump(
+                mode="json",
+            )
+            for candidate in candidates
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _accepted_candidates_from_verification(
+    verification: MemoryCandidateVerification,
+    validated_candidates: list[MemoryCandidate],
+    user_idea: str,
+    recent_human_feedback_items: list[dict],
+) -> list[MemoryCandidate]:
+    """
+    只接收Verifier明确ACCEPT、且仍能匹配已验证候选身份的结果。
+    """
+    validated_candidate_by_key = {
+        _candidate_key(candidate): candidate
+        for candidate in validated_candidates
+    }
+    accepted_candidates = []
+
+    for decision_item in verification.decisions:
+        if decision_item.decision != "ACCEPT":
+            continue
+
+        if not _candidate_has_valid_evidence(
+            decision_item,
+            user_idea,
+            recent_human_feedback_items,
+        ):
+            continue
+
+        candidate = validated_candidate_by_key.get(
+            _candidate_key(decision_item)
+        )
+
+        if candidate is not None:
+            accepted_candidates.append(candidate)
+
+    return accepted_candidates
+
+
+def _duration_from_candidate_value(
+    value: str,
+) -> int | None:
+    """
+    从候选值中提取秒数；解析失败则拒绝写入duration。
+    """
+    duration_match = re.search(
+        r"\d+",
+        value,
+    )
+
+    if duration_match is None:
+        return None
+
+    duration_sec = int(
+        duration_match.group()
+    )
+
+    if duration_sec <= 0:
+        return None
+
+    return duration_sec
+
+
+def _memory_update_from_candidates(
+    candidates: list[MemoryCandidate],
+    current_memory: UserMemory,
+) -> MemoryUpdate:
+    """
+    将Verifier接受的候选转换回现有MemoryUpdate结构，外部Merge/Store职责保持不变。
+    """
+    update_data = {
+        "should_update": True,
+        "preferred_genres_to_add": [],
+        "style_preferences_to_add": [],
+        "disliked_elements_to_add": [],
+        "preferred_duration_sec": None,
+        "additional_preferences_to_add": [],
+        "story_preferences_to_add": [],
+        "scene_preferences_to_add": [],
+    }
+
+    for candidate in candidates:
+        value = candidate.value.strip()
+
+        if not value:
+            continue
+
+        if candidate.field == "preferred_duration_sec":
+            duration_sec = _duration_from_candidate_value(
+                value
+            )
+
+            if duration_sec is not None:
+                update_data["preferred_duration_sec"] = duration_sec
+
+            continue
+
+        update_data[candidate.field].append(
+            value
+        )
+
+    return _normalize_memory_update(
+        MemoryUpdate(**update_data),
+        current_memory,
+    )
+
+
+def _render_candidate_prompt(
+    user_idea: str,
+    current_memory: UserMemory,
+    recent_human_feedback_items: list[dict],
+) -> RenderedPrompt:
+    """
+    渲染第一段候选提取Prompt，并保留调用追踪所需元数据。
+    """
+    current_memory_text = _format_current_memory(
+        current_memory
+    )
+    recent_human_feedback_text = _format_recent_human_feedback_items(
+        recent_human_feedback_items
+    )
+
+    return render_prompt(
+        "memory.candidate_extraction",
+        version="v1",
+        user_idea=user_idea,
+        current_memory_text=current_memory_text,
+        recent_human_feedback_text=(
+            recent_human_feedback_text
+        ),
+    )
+
+
+def _build_candidate_prompt(
+    user_idea: str,
+    current_memory: UserMemory,
+    recent_human_feedback_items: list[dict],
+) -> str:
+    """
+    返回候选提取Prompt正文，保留既有测试和内部调用契约。
+    """
+    return _render_candidate_prompt(
+        user_idea,
+        current_memory,
+        recent_human_feedback_items,
+    ).text
+
+
+def _render_verifier_prompt(
+    candidates: list[MemoryCandidate],
+) -> RenderedPrompt:
+    """
+    渲染保守Verifier Prompt，并保留调用追踪所需元数据。
+    """
+    candidate_text = _candidate_batch_to_json(
+        candidates
+    )
+
+    return render_prompt(
+        "memory.conservative_verifier",
+        version="v1",
+        candidate_text=candidate_text,
+    )
+
+
+def _build_verifier_prompt(
+    candidates: list[MemoryCandidate],
+) -> str:
+    """
+    返回Verifier Prompt正文，保留既有测试和内部调用契约。
+    """
+    return _render_verifier_prompt(
+        candidates
+    ).text
+
+
+def _legacy_memory_update_for_existing_tests(
+    prompt: str,
+    current_memory: UserMemory,
+) -> MemoryUpdate | None:
+    """
+    兼容旧测试中直接monkeypatch memory_update_llm的方式。
+
+    正常生产路径下memory_update_llm为None，不会走这里。
+    """
+    if memory_update_llm is None:
+        return None
+
+    raw_update = memory_update_llm.invoke(
+        prompt
+    )
+
+    if isinstance(
+        raw_update,
+        MemoryUpdate,
+    ):
+        return _normalize_memory_update(
+            raw_update,
+            current_memory,
+        )
+
+    return None
+
+
 def extract_memory_update(
     user_idea: str,    # 用户本次输入的原始需求
     current_memory: UserMemory,    # 当前已经读取到的完整长期记忆
     human_feedback_history: list[dict] | None = None,    # 本次执行中累计的人工反馈历史
 ) -> MemoryUpdate:
     """
-    从用户本次输入中提取长期偏好增量。
+    从用户本次输入和人工反馈中提取长期偏好增量。
 
-    参数：
-    - user_idea：用户本次输入的原始需求；
-    - current_memory：当前已经保存的用户长期记忆，用于判断哪些偏好已存在；
-    - human_feedback_history：本次执行中的人工审核反馈，只读取用户写下的反馈文本。
-
-    返回：
-    - MemoryUpdate，只包含用户明确表达的长期偏好增量。
+    Pipeline：
+    1. 候选提取LLM只提出带source/evidence的候选；
+    2. 代码层验证evidence必须存在于用户原文；
+    3. 保守Verifier批量决定ACCEPT/REJECT；
+    4. 只有ACCEPT候选才转换为MemoryUpdate。
     """
-    current_memory_text = _format_current_memory(
-        current_memory
-    )    # 结构化展示各字段，便于提取器按字段语义去重
-    recent_human_feedback_text = _format_recent_human_feedback(
+    recent_human_feedback_items = _collect_recent_human_feedback_items(
         human_feedback_history
-    )    # 人工反馈先由代码过滤、截断，再交给LLM判断长期价值
+    )
 
-    # 语义去重由提取器在输出增量前完成；merge只负责后续确定性的字符串去重和空值过滤。
-    # 这样可以避免“克制开放式结尾”和“含蓄开放结局”这类近义偏好反复写入Memory。
-    # 提取长期偏好增量的边界提示词
-    prompt = f"""
-你负责从用户文字中提取可跨不同作品复用的长期影视创作偏好增量。
+    # 没有任何用户文本来源时直接跳过；这不是长期关键词Gate，只是基础输入保护。
+    if not (user_idea or "").strip() and not recent_human_feedback_items:
+        return MemoryUpdate(
+            should_update=False,
+        )
 
-【用户本次输入】
-{user_idea}
-
-【当前长期 Memory】
-{current_memory_text}
-
-【本次人工审核反馈】
-{recent_human_feedback_text}
-
-仅输出符合 MemoryUpdate 结构的数据。
-
-提取边界：
-- 只依据用户输入和人工反馈，不依据机器 Review、模型生成内容或 final_output。
-- 只保存用户明确表达或明显可长期复用的稳定偏好。
-- 当前人物、地点、场次、具体剧情和单次时长等任务专属要求不保存。
-- 无法确定是否具有长期价值时，不更新。
-- 只返回新增内容，不覆盖已有 Memory，不复制整段用户原话。
-
-作用域与字段：
-- 故事、大纲、叙事和剧情结构偏好，只进入 story_preferences_to_add。
-- 分场、场景、镜头和场景动作偏好，只进入 scene_preferences_to_add。
-- preferred_genres_to_add：长期喜欢的影片类型。
-- style_preferences_to_add：适用于整体创作的长期风格偏好。
-- disliked_elements_to_add：适用于整体创作的长期排斥元素。
-- preferred_duration_sec：仅提取长期时长偏好。
-- additional_preferences_to_add：其他长期全局偏好。
-- 只有用户明确表示适用于整体创作时，Scoped 偏好才可提升为全局偏好。
-
-语义去重：
-- 新候选必须与对应字段的已有 Memory 比较。
-- 含义相同或高度重合时，即使措辞不同，也不要重复输出。
-- Scoped 候选与全局候选语义重合时，只保留 Scoped 候选。
-- 已有 Scoped 近义偏好时，不得改写到全局字段绕过去重。
-- Story 与 Scene 分别管理，不跨作用域互相删除。
-- 新偏好应规范化为简短、稳定、可复用的表达。
-
-没有真实新增内容时，返回 should_update=false。
-"""
-
-    raw_update = memory_update_llm.invoke(prompt)    # 返回结构化MemoryUpdate，不保存也不合并
-
-    return _normalize_memory_update(
-        raw_update,
+    candidate_rendered = _render_candidate_prompt(
+        user_idea,
         current_memory,
-    )    # 校正LLM输出，避免无效增量触发后续保存
+        recent_human_feedback_items,
+    )
+
+    legacy_update = _legacy_memory_update_for_existing_tests(
+        candidate_rendered.text,
+        current_memory,
+    )
+
+    if legacy_update is not None:
+        return legacy_update
+
+    candidate_batch = invoke_structured_llm(
+        memory_candidate_llm,
+        candidate_rendered,
+        node="update_memory",
+    )
+    validated_candidates = _filter_candidates_with_evidence(
+        candidate_batch.candidates,
+        user_idea,
+        recent_human_feedback_items,
+    )
+
+    if not validated_candidates:
+        return MemoryUpdate(
+            should_update=False,
+        )
+
+    verifier_rendered = _render_verifier_prompt(
+        validated_candidates
+    )
+    verification = invoke_structured_llm(
+        memory_verifier_llm,
+        verifier_rendered,
+        node="update_memory",
+    )
+    accepted_candidates = _accepted_candidates_from_verification(
+        verification,
+        validated_candidates,
+        user_idea,
+        recent_human_feedback_items,
+    )
+
+    if not accepted_candidates:
+        return MemoryUpdate(
+            should_update=False,
+        )
+
+    return _memory_update_from_candidates(
+        accepted_candidates,
+        current_memory,
+    )

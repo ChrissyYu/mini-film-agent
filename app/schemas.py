@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from observability.models import ExecutionSummary
+
 
 USER_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_-]{1,64}$"
@@ -82,6 +84,7 @@ class FilmGenerateResponse(BaseModel):
     final_output: dict[str, Any]    # 最终影片策划结果
     execution_trace: list[TraceEventResponse]    # 本次执行产生的节点轨迹
     memory_update_status: str | None    # Memory更新状态，可能为空
+    execution_summary: ExecutionSummary    # 本次Graph执行的汇总观测信息
 
 
 class HitlResumeRequest(BaseModel):
@@ -123,3 +126,4 @@ class HitlFilmResponse(BaseModel):
     final_output: dict[str, Any] | None = None    # 完成时返回的最终影片策划结果
     execution_trace: list[TraceEventResponse] = Field(default_factory=list)    # 已完成节点轨迹
     memory_update_status: str | None = None    # Memory更新状态，可能为空
+    execution_summary: ExecutionSummary    # 本次HITL执行当前状态的汇总观测信息

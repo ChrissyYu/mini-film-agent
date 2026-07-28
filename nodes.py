@@ -1,31 +1,32 @@
-import os
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 import json
 
+from llm_profiles.factory import create_structured_llm
 from memory.context import format_scene_memory_context, format_story_memory_context
+from observability.llm_calls import (
+    collect_llm_call_trace,
+    invoke_structured_llm,
+)
+from prompts.renderer import render_prompt
 from state import FilmState
 from schemas import FilmBrief, CharacterList, StoryOutline, Character, SceneList, Scene
 
-#=============== 配置 LLM ===============
-load_dotenv()
-api_key = os.getenv("DASHSCOPE_API_KEY")
-
-if not api_key:
-    raise ValueError("未找到DASHSCOPE_API_KEY, 请在.env文件中配置")
-
-llm = ChatOpenAI(
-    api_key=api_key, # 阿里云dashscope控制台获取sk开头密钥
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", # 千问兼容接口固定地址
-    model="qwen-plus", # 必须选支持function call的模型：qwen-plus/qwen-turbo/qwen2.5系列
-    temperature=0 # 降低需求提取的随机性，使结构化输出更稳定
+#=============== 配置 structured LLM ===============
+brief_llm = create_structured_llm(
+    "generation.analyze_brief",
+    FilmBrief,
 )
-
-#=============== 配置 LLM with structured output 函数 ===============
-brief_llm = llm.with_structured_output(FilmBrief) # 分析创意
-character_llm = llm.with_structured_output(CharacterList) # 设计角色
-story_outline_llm = llm.with_structured_output(StoryOutline) # 设计故事大纲
-write_scenes_llm = llm.with_structured_output(SceneList) # 设计分场镜头
+character_llm = create_structured_llm(
+    "generation.design_characters",
+    CharacterList,
+)
+story_outline_llm = create_structured_llm(
+    "generation.plan_story",
+    StoryOutline,
+)
+write_scenes_llm = create_structured_llm(
+    "generation.write_scenes",
+    SceneList,
+)
 
 #=============== nodes函数定义 ===============
 # 分析创意
@@ -41,38 +42,23 @@ def analyze_brief(state: FilmState) -> dict:
             indent=2,
         )
 
-    prompt = f"""
+    rendered = render_prompt(
+        "generation.analyze_brief",
+        version="v1",
+        user_idea=user_idea,
+        memory_text=memory_text,
+    )
+    with collect_llm_call_trace() as llm_call_events:
+        film_brief: FilmBrief = invoke_structured_llm(
+            brief_llm,
+            rendered,
+            node="analyze_brief",
+        )
 
-    你是一名影视前期策划专家。请分析下面的短片创意，并提取结构化的创作需求。
-    【用户本次需求】
-    {user_idea}
-    【用户长期偏好】
-    {memory_text}
-    
-    使用长期偏好时必须遵守：
-    - 用户本次需求的优先级高于长期偏好
-    - 只使用与当前任务相关的偏好
-    - 不要强行加入无关的历史偏好
-    - 如果当前需求与长期偏好冲突，以当前需求为准
-    - 如果长期偏好为空，则只根据本次需求进行策划
-
-    要求：
-    1. 提取目标时长，单位为秒；
-    2. 判断主要影片类型；
-    3. 总结作品的核心主题；
-    4. 给出一句简短视觉风格描述，只包含整体色调、氛围和艺术方向，不描述镜头、构图、剪辑、摄影技巧，视觉风格控制在30字以内；
-    5. 根据目标时长和故事复杂度，推荐合理的分场数量。
-    参考：
-    - 30秒以内：3-5个场景
-    - 30-90秒：4-8个场景
-    - 90秒以上：8个以上场景
-    不要机械按照规则，根据剧情复杂度调整。
-    6. 不要继续创作角色和剧情。
-    """
-    film_brief: FilmBrief = brief_llm.invoke(prompt)
     return {
         "film_brief": film_brief,
-        "current_stage": "brief_completed"
+        "current_stage": "brief_completed",
+        "llm_call_trace": llm_call_events,
     }
 
 
@@ -84,26 +70,25 @@ def design_characters(state: FilmState) -> dict:
     core_theme = film_brief.core_theme
     visual_style = film_brief.visual_style
 
-    prompt = f"""
-    你是一名影视前期策划师。请根据下面的短片创意，设计出结构化的角色列表。
-    用户输入的创意：{user_idea}
-    影片类型：{genre}
-    核心主题：{core_theme}
-    视觉风格：{visual_style}
-    要求：
-    1. 设计必要的角色列表；
-    2. 每个角色包含：角色名称、身份、外貌与穿着、性格特征、行为动机、连续性约束；
-    3. 每个角色的性格特征不超过3项，性格特征使用简短形容词或短语；
-    4. 行为动机用一句简洁的话描述；
-    5. 每个角色给出2至3条连续性约束。连续性约束应描述角色在不同场景中保持不变的外貌、服装、配饰或关键行为特征。不要要求某个细节在每个镜头中都必须可见，不要规定物体必须朝向镜头，不要约束由机位、光照或构图导致的视觉效果；
-    6. 控制角色数量，通常为1至3个主要角色；
-    7. 不同角色的名字应明显不同，避免同字、近音或容易混淆；
-    8. 不要继续创作剧情或场景。
-    """
-    characters_result: CharacterList = character_llm.invoke(prompt)
+    rendered = render_prompt(
+        "generation.design_characters",
+        version="v1",
+        user_idea=user_idea,
+        genre=genre,
+        core_theme=core_theme,
+        visual_style=visual_style,
+    )
+    with collect_llm_call_trace() as llm_call_events:
+        characters_result: CharacterList = invoke_structured_llm(
+            character_llm,
+            rendered,
+            node="design_characters",
+        )
+
     return {
         "characters": characters_result.characters,
-        "current_stage": "characters_completed"
+        "current_stage": "characters_completed",
+        "llm_call_trace": llm_call_events,
     }
 
 
@@ -123,62 +108,28 @@ def plan_story(state: FilmState) -> dict:
     characters_data = [character.model_dump() for character in state["characters"]] # 将list格式的characters，每个单独取出，转换为json格式
     characters_json = json.dumps(characters_data, ensure_ascii=False, indent=2)
     
-    prompt = f"""
-    你是一名专业影视编剧和前期策划师。
-    请根据用户创意、影片需求和角色设定，设计一个适合短片制作的故事结构大纲。
+    rendered = render_prompt(
+        "generation.plan_story",
+        version="v1",
+        user_idea=user_idea,
+        genre=genre,
+        core_theme=core_theme,
+        visual_style=visual_style,
+        target_duration_sec=target_duration_sec,
+        characters_json=characters_json,
+        story_memory_text=story_memory_text,
+    )
+    with collect_llm_call_trace() as llm_call_events:
+        story_outline: StoryOutline = invoke_structured_llm(
+            story_outline_llm,
+            rendered,
+            node="plan_story",
+        )
 
-    用户输入的创意：{user_idea}
-    影片类型：{genre}
-    核心主题：{core_theme}
-    视觉风格：{visual_style}
-    目标时长：{target_duration_sec}秒
-    角色列表：{characters_json}
-
-    【Story阶段可参考的长期Memory】
-    {story_memory_text}
-
-    Memory使用原则：
-    - 当前用户要求优先于长期Memory。
-    - 长期Memory仅作为可参考的稳定偏好，不是硬性任务。
-    - 如果长期Memory与当前任务冲突，必须忽略Memory，以当前任务为准。
-    - Story阶段不参考scene_preferences，避免把分场设计偏好混入故事大纲。
-
-    请输出结构化故事大纲：
-    - setup：故事开端
-    - conflict：核心冲突
-    - turning_point：关键转折
-    - ending：故事结局
-    - theme：核心主题
-
-    严格要求：
-    1. 输出的是故事策划阶段的大纲，不是文学故事，也不是拍摄脚本；
-    2. 只描述：
-    - 人物关系变化；
-    - 核心事件；
-    - 情绪变化；
-    - 故事因果关系；
-    3. 不描述：
-    - 具体环境描写；
-    - 人物外貌细节；
-    - 人物动作细节；
-    - 道具细节；
-    - 镜头语言；
-    - 画面语言；
-    4. 不使用：
-    - “镜头”
-    - “画面”
-    - “特写”
-    等视觉文学化表达；
-    5. 每个字段50字以内；
-    6. 故事只包含一个核心冲突，一个关键转折；
-    7. 不新增角色，不展开对白；
-    8. 后续节点会根据该大纲生成具体分场，因此当前只提供故事骨架。
-    9. 不要为故事结尾设计具体事件、道具或动作，保留后续分场创作空间。
-    """
-    story_outline: StoryOutline = story_outline_llm.invoke(prompt)
     return {
         "story_outline": story_outline,
-        "current_stage": "story_outline_completed"
+        "current_stage": "story_outline_completed",
+        "llm_call_trace": llm_call_events,
     }
 
 
@@ -198,56 +149,29 @@ def write_scenes(state: FilmState) -> dict:
 
     story_outline_json = json.dumps(story_outline.model_dump(), ensure_ascii=False, indent=2) # 将story_outline转换为json格式
 
-    prompt = f"""
-    你是一名影视制作规划师。
-    请根据故事大纲和角色设定，
-    生成一个适合{target_duration_sec}秒短片的分场规划。
+    rendered = render_prompt(
+        "generation.write_scenes",
+        version="v1",
+        target_duration_sec=target_duration_sec,
+        user_idea=user_idea,
+        story_outline_json=story_outline_json,
+        characters_json=characters_json,
+        scene_memory_text=scene_memory_text,
+        recommended_scene_count=(
+            film_brief.recommended_scene_count
+        ),
+    )
+    with collect_llm_call_trace() as llm_call_events:
+        scenes_result: SceneList = invoke_structured_llm(
+            write_scenes_llm,
+            rendered,
+            node="write_scenes",
+        )
 
-    用户创意: {user_idea}
-    故事大纲: {story_outline_json}
-    角色列表: {characters_json}
-
-    【Scene阶段可参考的长期Memory】
-    {scene_memory_text}
-
-    Memory使用原则：
-    - 当前用户要求优先于长期Memory。
-    - 长期Memory只作稳定偏好参考，不是硬性任务。
-    - 如果长期Memory与当前任务冲突，必须忽略Memory，以当前任务为准。
-    - story_preferences用于继承故事方向；scene_preferences用于约束分场执行。
-
-    要求：
-    1. 根据推荐分场数量生成场景。
-    推荐场景数量：{film_brief.recommended_scene_count}
-    允许根据故事完整性上下浮动1个场景。
-    不要为了满足数量增加无关事件。
-    2. 每个场景包含：
-    - 场景编号
-    - 时长
-    - 地点
-    - 参与角色
-    - 场景动作
-    - 必要对白
-    - 视觉目标
-    3. 每个场景 duration_sec 必须为正整数，且不超过{target_duration_sec}秒，所有 scene 的 duration_sec 之和必须等于目标时长{target_duration_sec}秒；
-    4. 每个场景必须推动故事发展；
-    5. 只能使用已有角色，不新增角色；
-    6. action只描述人物行为和剧情推进，不描述摄影画面、光影、气氛。
-    7. visual_goal描述该场景希望传达的情绪或叙事目的；
-    8. 不生成：
-    - 摄影机参数
-    - 镜头运动
-    - 分镜编号
-    - 视频生成prompt；
-    9. 输出的是前期策划分场，不是完整剧本。
-    10. 每个场景只描述一个主要事件；
-    11. 场景之间应该形成连续叙事关系，而不是独立片段；
-    12. 不要为了填充时长增加无关事件；
-    """
-    scenes_result: SceneList = write_scenes_llm.invoke(prompt)
     return {
         "scenes": scenes_result.scenes,
-        "current_stage": "scenes_completed"
+        "current_stage": "scenes_completed",
+        "llm_call_trace": llm_call_events,
     }
 
 

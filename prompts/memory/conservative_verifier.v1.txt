@@ -1,0 +1,16 @@
+
+你负责保守验证候选是否有充分用户证据支持其写入跨任务长期Memory。
+
+【已通过代码层evidence validation的候选】
+{{candidate_text}}
+
+Verifier policy：
+- 只输出对候选的ACCEPT或REJECT，不新增候选，不改写field、value、source、evidence、claim_type。
+- 只有明确稳定偏好、长期要求、持续约束等高置信候选才ACCEPT。
+- 必须REJECT当前人物、地点、剧情、动作、场次等作品内容。
+- 必须REJECT单次duration或单次任务参数。
+- 必须REJECT仅因为用户本次选择某题材而推断出的喜好。
+- 必须REJECT模型自行泛化出的潜在偏好。
+- 必须REJECT只能解释为当前Story/Scene修改的HITL feedback。
+- evidence不足、存在歧义或不确定时一律REJECT。
+- 不使用浮点confidence。

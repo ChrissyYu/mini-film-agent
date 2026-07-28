@@ -179,12 +179,15 @@ def test_hitl_stream_start_waiting_for_human(monkeypatch):
         "human_review_required",
     ]
     assert "completed" not in _event_names(events)
+    assert "execution_summary" not in events[1]["data"]
     _assert_all_execution_ids(
         events,
         execution_id,
     )
     assert events[-1]["data"]["status"] == "waiting_for_human"
     assert events[-1]["data"]["review_payload"]["type"] == "story_review_required"
+    assert events[-1]["data"]["execution_summary"]["status"] == "waiting_for_human"
+    assert events[-1]["data"]["execution_summary"]["trace_event_count"] == 1
 
 
 def test_hitl_stream_start_completed(monkeypatch):
@@ -242,6 +245,9 @@ def test_hitl_stream_start_completed(monkeypatch):
     assert events[-1]["data"]["final_output"] == {
         "user_idea": "生成一个校园故事",
     }
+    assert events[-1]["data"]["execution_summary"]["status"] == "completed"
+    assert events[-1]["data"]["execution_summary"]["trace_event_count"] == 2
+    assert "execution_summary" not in events[1]["data"]
 
 
 def test_hitl_stream_start_error(monkeypatch):
@@ -276,6 +282,9 @@ def test_hitl_stream_start_error(monkeypatch):
         "error",
     ]
     assert "completed" not in _event_names(events)
+    assert events[-1]["data"]["execution_summary"]["status"] == "failed"
+    assert events[-1]["data"]["execution_summary"]["error_type"] == "RuntimeError"
+    assert events[-1]["data"]["execution_summary"]["error_message"] == "Film Graph执行失败。"
     assert "internal fake graph error" not in raw_text
     assert "Traceback" not in raw_text
 
@@ -349,6 +358,9 @@ def test_hitl_stream_resume_approve_completed(monkeypatch):
     assert events[-1]["data"]["final_output"] == {
         "user_idea": "生成一个校园故事",
     }
+    assert events[-1]["data"]["execution_summary"]["status"] == "completed"
+    assert events[-1]["data"]["execution_summary"]["memory_update_status"] == "skipped"
+    assert "execution_summary" not in events[1]["data"]
 
 
 def test_hitl_stream_resume_revise_waiting_again(monkeypatch):
@@ -410,6 +422,11 @@ def test_hitl_stream_resume_revise_waiting_again(monkeypatch):
     ]
     assert "completed" not in _event_names(events)
     assert events[-1]["data"]["review_payload"]["execution_id"] == execution_id
+    assert events[-1]["data"]["execution_summary"]["status"] == "waiting_for_human"
+    assert events[-1]["data"]["execution_summary"]["node_execution_counts"] == {
+        "revise_story": 1,
+    }
+    assert "execution_summary" not in events[1]["data"]
 
 
 def test_hitl_stream_resume_missing_checkpoint_returns_404(monkeypatch):

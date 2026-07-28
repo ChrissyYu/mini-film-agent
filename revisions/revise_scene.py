@@ -1,14 +1,22 @@
 import json
 
+from llm_profiles.factory import create_structured_llm
 from memory.context import format_scene_memory_context
-from nodes import llm
+from observability.llm_calls import (
+    collect_llm_call_trace,
+    invoke_structured_llm,
+)
+from prompts.renderer import render_prompt
 from state import FilmState
 from schemas import SceneList
 
 
 # ================= LLM配置 =================
 
-scene_revise_llm = llm.with_structured_output(SceneList) # 根据review反馈，对已有scene进行修复
+scene_revise_llm = create_structured_llm(
+    "revision.scene",
+    SceneList,
+)
 
 
 def _collect_history_issue_constraints(
@@ -165,109 +173,33 @@ def revise_scene(state: FilmState) -> dict:
         indent=2
     )
 
-    prompt = f"""
-你是一名影视分场方案修改专家。
-
-现在已有一份短片分场方案，审核阶段发现了一些问题。
-你的任务是在保留原故事、角色和分场结构的基础上，
-进行最小必要修改，而不是重新创作整套方案。
-
-【影片需求】
-{film_brief}
-
-【角色设定】
-{characters}
-
-【故事大纲】
-{story_outline}
-
-【当前分场方案】
-{current_scene_json}
-
-【Scene阶段可参考的长期Memory】
-{scene_memory_text}
-
-Memory使用原则：
-- 当前人工反馈和本轮Review优先于长期Memory。
-- 长期Memory只作稳定偏好参考，不是硬性修订要求。
-- 如果长期Memory与当前人工反馈、本轮Review或当前任务冲突，必须忽略Memory。
-- story_preferences用于继承故事方向；scene_preferences用于约束分场执行。
-
-【当前人工意见——优先级最高】
-{human_feedback_text}
-
-【本轮机器审核问题——必须处理】
-issues:
-{scene_review_issues}
-suggestions:
-{scene_review_suggestions}
-
-【仍需避免的历史问题】
-{active_history_issues_text}
-
-【已解决问题的防回归提醒】
-{resolved_history_reminders_text}
-
-这些问题当前已解决，不需要为了它们重新修改，只需避免本次修改让它们回归。
-
-优先级规则：
-最新人工意见
-> 本轮机器审核问题
-> 仍未解决或回归的历史问题
-> 已解决问题的防回归提醒
-> 长期 Memory
-
-修改要求：
-
-1. 如果存在当前人工意见，必须优先遵守当前人工意见。
-在满足人工意见的前提下，如果机器审核 issues 存在，必须处理其中明确指出的阻断性问题；suggestions 仅作为优化参考。
-只修改存在问题的scene；没有问题的scene尽量保持原样。
-
-2. 修改时不得重新引入“仍需避免的历史问题”；历史为空时按“无历史问题”处理。
-“已解决问题的防回归提醒”当前不需要重新修改，只需避免回归。
-
-3. 保持以下内容不变：
-- 故事主题和核心冲突
-- 角色身份、性格和核心动机
-- setup → conflict → turning point → ending 的叙事顺序
-
-4. 严格遵守角色continuity_constraints：
-- 不得摘下、解开、替换、转移或改变被要求固定的服装、道具、外观和状态
-- 如果原action明确违反约束，替换为不违反约束但叙事作用相近的动作
-- 不需要在每个scene中重复说明所有约束仍然成立
-- 未被明确改变的状态默认保持不变
-
-5. 禁止：
-- 新增角色
-- 修改角色设定
-- 为修复一个问题引入新的连续性冲突
-- 添加与故事大纲无关的新事件
-
-6. 分场结构要求：
-- scene_id连续且不重复
-- 场景数量符合影片需求
-- 所有duration_sec之和等于目标时长
-- characters只能使用已定义角色
-- action描述可理解的剧情行为
-- visual_goal描述该场景的叙事目的
-
-7. 如果审核反馈包含推测性问题，
-例如“某动作可能导致道具变化”或“未明确重复说明约束状态”，
-但原action没有明确改变continuity_constraint，
-则无需为此添加冗余说明。
-
-8. 不要添加：
-- 摄影机参数
-- 机位、景别、运镜等详细镜头语言
-- 视频生成prompt
-- 与问题无关的额外细节
-
-请输出完整修改后的SceneList。
-"""
-
-    new_scene_list = (
-        scene_revise_llm.invoke(prompt)
+    rendered = render_prompt(
+        "revision.scene",
+        version="v1",
+        film_brief=film_brief,
+        characters=characters,
+        story_outline=story_outline,
+        current_scene_json=current_scene_json,
+        scene_memory_text=scene_memory_text,
+        human_feedback_text=human_feedback_text,
+        scene_review_issues=scene_review_issues,
+        scene_review_suggestions=scene_review_suggestions,
+        active_history_issues_text=(
+            active_history_issues_text
+        ),
+        resolved_history_reminders_text=(
+            resolved_history_reminders_text
+        ),
     )
+
+    with collect_llm_call_trace() as llm_call_events:
+        new_scene_list = (
+            invoke_structured_llm(
+                scene_revise_llm,
+                rendered,
+                node="revise_scene",
+            )
+        )
 
     return {
         "scenes": new_scene_list.scenes, # 修改后的scene列表
@@ -276,7 +208,8 @@ suggestions:
                 "scene_revision_count",
                 0
             ) + 1, # 分场方案修改次数+1
-        "current_stage": "scene_revised_completed" # 分场方案修改完成
+        "current_stage": "scene_revised_completed", # 分场方案修改完成
+        "llm_call_trace": llm_call_events,
     }
 
 # ================= 测试 =================

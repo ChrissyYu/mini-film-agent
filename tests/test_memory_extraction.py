@@ -10,18 +10,102 @@ extract_memory_module = importlib.import_module("memory.extract_memory")
 update_memory_module = importlib.import_module("memory.update_memory")
 
 
-class FakeMemoryUpdateLLM:
+class FakeCandidateLLM:
     """
-    捕获Prompt并返回预设MemoryUpdate，避免调用真实LLM。
+    捕获候选提取Prompt并返回预设候选，避免调用真实LLM。
     """
 
-    def __init__(self, result: MemoryUpdate):
-        self.result = result
+    def __init__(self, candidates):
+        self.result = extract_memory_module.MemoryCandidateBatch(
+            candidates=candidates,
+        )
         self.prompts = []
 
-    def invoke(self, prompt: str) -> MemoryUpdate:
+    def invoke(self, prompt: str):
         self.prompts.append(prompt)
         return self.result
+
+
+class FakeVerifierLLM:
+    """
+    捕获Verifier Prompt并返回预设裁决，避免调用真实LLM。
+    """
+
+    def __init__(self, decisions):
+        self.result = extract_memory_module.MemoryCandidateVerification(
+            decisions=decisions,
+        )
+        self.prompts = []
+
+    def invoke(self, prompt: str):
+        self.prompts.append(prompt)
+        return self.result
+
+
+def _candidate(
+    field: str,
+    value: str,
+    source: str,
+    evidence: str,
+    claim_type: str = "explicit_preference",
+):
+    """
+    构造内部Memory候选，测试重点放在证据和Verifier流程上。
+    """
+    return extract_memory_module.MemoryCandidate(
+        field=field,
+        value=value,
+        source=source,
+        evidence=evidence,
+        claim_type=claim_type,
+    )
+
+
+def _decision(
+    candidate,
+    decision: str,
+):
+    """
+    Verifier必须回传同一个候选身份，代码才会接受ACCEPT。
+    """
+    return extract_memory_module.MemoryCandidateDecisionItem(
+        **candidate.model_dump(
+            mode="json",
+        ),
+        decision=decision,
+    )
+
+
+def _patch_memory_pipeline(
+    monkeypatch,
+    candidates,
+    decisions,
+):
+    """
+    同时替换候选提取LLM和批量Verifier。
+    """
+    fake_candidate_llm = FakeCandidateLLM(
+        candidates,
+    )
+    fake_verifier_llm = FakeVerifierLLM(
+        decisions,
+    )
+    monkeypatch.setattr(
+        extract_memory_module,
+        "memory_candidate_llm",
+        fake_candidate_llm,
+    )
+    monkeypatch.setattr(
+        extract_memory_module,
+        "memory_verifier_llm",
+        fake_verifier_llm,
+    )
+    monkeypatch.setattr(
+        extract_memory_module,
+        "memory_update_llm",
+        None,
+    )
+    return fake_candidate_llm, fake_verifier_llm
 
 
 def _assert_prompt_has_keywords(
@@ -29,7 +113,7 @@ def _assert_prompt_has_keywords(
     keywords: list[str],
 ) -> None:
     """
-    Prompt会按阶段持续精简；测试只绑定关键语义词，避免依赖整句文案。
+    Prompt会继续迭代；测试绑定稳定规则和字段，不绑定整段自然语言。
     """
     for keyword in keywords:
         assert keyword in prompt
@@ -45,66 +129,89 @@ def _current_memory() -> UserMemory:
     )
 
 
-def test_prompt_contains_semantic_dedup_and_normalization_rules(monkeypatch):
+def _assert_no_increment(update) -> None:
     """
-    Prompt应明确语义比较、作用域比较和规范化规则。
+    统一断言没有任何长期偏好增量。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    assert update.should_update is False
+    assert update.preferred_genres_to_add == []
+    assert update.style_preferences_to_add == []
+    assert update.disliked_elements_to_add == []
+    assert update.preferred_duration_sec is None
+    assert update.additional_preferences_to_add == []
+    assert update.story_preferences_to_add == []
+    assert update.scene_preferences_to_add == []
+
+
+def test_candidate_and_verifier_prompts_describe_new_pipeline(monkeypatch):
+    """
+    Prompt应明确候选无写入权、Evidence Validation前置、Verifier保守裁决。
+    """
+    candidate = _candidate(
+        "story_preferences_to_add",
+        "故事结尾保持克制开放",
+        "user_idea",
+        "以后故事结尾保持克制开放",
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+    fake_candidate_llm, fake_verifier_llm = _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
+        [
+            _decision(
+                candidate,
+                "REJECT",
+            )
+        ],
     )
 
     extract_memory_module.extract_memory_update(
-        user_idea="以后故事结尾更含蓄。",
+        user_idea="以后故事结尾保持克制开放。",
         current_memory=_current_memory(),
     )
 
-    prompt = fake_llm.prompts[-1]
+    candidate_prompt = fake_candidate_llm.prompts[-1]
+    verifier_prompt = fake_verifier_llm.prompts[-1]
 
-    assert "提取边界：" in prompt
-    assert "作用域与字段：" in prompt
-    assert "语义去重：" in prompt
     _assert_prompt_has_keywords(
-        prompt,
+        candidate_prompt,
         [
-            "长期",
-            "复用",
-            "任务专属要求不保存",
+            "没有写入Memory的权限",
+            "evidence必须逐字来自对应source原文",
+            "explicit_preference",
+            "task_constraint",
+            "inferred_preference",
             "story_preferences_to_add",
             "scene_preferences_to_add",
-            "对应字段",
-            "已有 Memory",
-            "Scoped",
-            "全局",
+            "语义比较",
             "简短",
             "稳定",
+        ],
+    )
+    _assert_prompt_has_keywords(
+        verifier_prompt,
+        [
+            "ACCEPT",
+            "REJECT",
+            "高置信",
+            "必须REJECT单次duration",
+            "不确定时一律REJECT",
+            "不使用浮点confidence",
         ],
     )
 
 
 def test_current_memory_is_displayed_by_fields(monkeypatch):
     """
-    当前Memory应按字段结构化展示，便于按字段比较。
+    当前Memory应按字段结构化展示，便于候选提取按字段比较。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+    fake_candidate_llm, _ = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
     )
 
     extract_memory_module.extract_memory_update(
-        user_idea="以后故事更克制。",
+        user_idea="我讨厌大团圆结局。",
         current_memory=UserMemory(
             user_id="demo_user",
             preferred_genres=["校园"],
@@ -117,7 +224,7 @@ def test_current_memory_is_displayed_by_fields(monkeypatch):
         ),
     )
 
-    prompt = fake_llm.prompts[-1]
+    prompt = fake_candidate_llm.prompts[-1]
 
     assert '"preferred_genres"' in prompt
     assert '"style_preferences"' in prompt
@@ -128,487 +235,181 @@ def test_current_memory_is_displayed_by_fields(monkeypatch):
     assert '"scene_preferences"' in prompt
 
 
-def test_story_feedback_can_enter_story_preferences(monkeypatch):
+def test_explicit_dislike_without_old_regex_keyword_can_be_saved(monkeypatch):
     """
-    通用story人工反馈可以提取为故事偏好增量。
+    “我讨厌...”不依赖旧regex关键词，也能通过证据和Verifier写入。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            story_preferences_to_add=[
-                "故事结尾保持克制开放",
-            ],
-        )
+    candidate = _candidate(
+        "disliked_elements_to_add",
+        "大团圆结局",
+        "user_idea",
+        "我讨厌大团圆结局",
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=_current_memory(),
-        human_feedback_history=[
-            {
-                "scope": "story",
-                "decision": "revise",
-                "feedback": "以后故事结尾尽量保持克制开放。",
-            }
-        ],
-    )
-
-    prompt = fake_llm.prompts[-1]
-
-    assert result.should_update is True
-    assert result.story_preferences_to_add == [
-        "故事结尾保持克制开放",
-    ]
-    assert result.scene_preferences_to_add == []
-    assert '"scope": "story"' in prompt
-    assert "以后故事结尾尽量保持克制开放" in prompt
-
-
-def test_story_scoped_preference_is_not_also_global(monkeypatch):
-    """
-    Story限定偏好不应同时写入全局字段。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            story_preferences_to_add=[
-                "故事结尾保持克制开放",
-            ],
-            disliked_elements_to_add=[
-                "故事结尾保持克制开放",
-            ],
-            additional_preferences_to_add=[
-                "故事结尾保持克制开放",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后故事结尾保持克制开放。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is True
-    assert result.story_preferences_to_add == [
-        "故事结尾保持克制开放",
-    ]
-    assert result.disliked_elements_to_add == []
-    assert result.additional_preferences_to_add == []
-
-
-def test_story_semantic_duplicate_is_not_output(monkeypatch):
-    """
-    story近义偏好已存在时，提取结果应为空增量。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后故事结尾尽量含蓄一点。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                "故事结尾保持克制开放",
-            ],
-        ),
-        human_feedback_history=[
-            {
-                "scope": "story",
-                "decision": "revise",
-                "feedback": "今后结局别说太满，保持开放。",
-            }
-        ],
-    )
-
-    assert result.should_update is False
-    assert result.story_preferences_to_add == []
-    assert result.scene_preferences_to_add == []
-    assert "故事结尾保持克制开放" in fake_llm.prompts[-1]
-
-
-def test_scene_feedback_can_enter_scene_preferences(monkeypatch):
-    """
-    通用scene人工反馈可以提取为分场偏好增量。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            scene_preferences_to_add=[
-                "分场动作保持可拍摄",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=_current_memory(),
-        human_feedback_history=[
-            {
-                "scope": "scene",
-                "decision": "revise",
-                "feedback": "今后分场动作都写得更具体、可拍摄。",
-            }
-        ],
-    )
-
-    prompt = fake_llm.prompts[-1]
-
-    assert result.should_update is True
-    assert result.scene_preferences_to_add == [
-        "分场动作保持可拍摄",
-    ]
-    assert result.story_preferences_to_add == []
-    assert '"scope": "scene"' in prompt
-    assert "今后分场动作都写得更具体、可拍摄" in prompt
-
-
-def test_scene_scoped_preference_is_not_also_global(monkeypatch):
-    """
-    Scene限定偏好不应同时写入全局字段。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            scene_preferences_to_add=[
-                "场景动作减少解释性对白",
-            ],
-            disliked_elements_to_add=[
-                "场景动作减少解释性对白",
-            ],
-            style_preferences_to_add=[
-                "场景动作减少解释性对白",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后场景动作减少解释性对白。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is True
-    assert result.scene_preferences_to_add == [
-        "场景动作减少解释性对白",
-    ]
-    assert result.disliked_elements_to_add == []
-    assert result.style_preferences_to_add == []
-
-
-def test_scene_semantic_duplicate_is_not_output(monkeypatch):
-    """
-    scene近义偏好已存在时，提取结果应为空增量。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次继续生成校园故事。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            scene_preferences=[
-                "分场动作保持可拍摄",
-            ],
-        ),
-        human_feedback_history=[
-            {
-                "scope": "scene",
-                "decision": "revise",
-                "feedback": "以后每场动作都要能实际拍出来。",
-            }
-        ],
-    )
-
-    assert result.should_update is False
-    assert result.scene_preferences_to_add == []
-    assert result.story_preferences_to_add == []
-    assert "分场动作保持可拍摄" in fake_llm.prompts[-1]
-
-
-def test_story_and_scene_similar_preferences_do_not_dedup_across_scope(monkeypatch):
-    """
-    story与scene内容相似时，不应跨作用域去重。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            scene_preferences_to_add=[
-                "分场表达保持克制",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                "故事表达保持克制",
-            ],
-        ),
-        human_feedback_history=[
-            {
-                "scope": "scene",
-                "decision": "revise",
-                "feedback": "以后分场表达也保持克制。",
-            }
-        ],
-    )
-
-    assert result.should_update is True
-    assert result.scene_preferences_to_add == [
-        "分场表达保持克制",
-    ]
-    assert result.story_preferences_to_add == []
-    _assert_prompt_has_keywords(
-        fake_llm.prompts[-1],
+    _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
         [
-            "Story",
-            "Scene",
-            "分别管理",
-            "不跨作用域互相删除",
+            _decision(
+                candidate,
+                "ACCEPT",
+            )
         ],
     )
 
-
-def test_story_and_scene_scoped_preferences_remain_independent(monkeypatch):
-    """
-    Story与Scene scoped偏好即使文本相同，也不互相删除。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            story_preferences_to_add=[
-                "表达保持克制",
-            ],
-            scene_preferences_to_add=[
-                "表达保持克制",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
     result = extract_memory_module.extract_memory_update(
-        user_idea="以后故事和分场表达都保持克制。",
+        user_idea="我讨厌大团圆结局。",
         current_memory=_current_memory(),
-    )
-
-    assert result.should_update is True
-    assert result.story_preferences_to_add == [
-        "表达保持克制",
-    ]
-    assert result.scene_preferences_to_add == [
-        "表达保持克制",
-    ]
-
-
-def test_different_new_preference_can_still_be_output(monkeypatch):
-    """
-    确实不同的新偏好仍应允许输出。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            story_preferences_to_add=[
-                "故事冲突保持生活化",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后故事冲突尽量从日常生活里生长出来。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                "故事结尾保持克制开放",
-            ],
-        ),
-    )
-
-    assert result.should_update is True
-    assert result.story_preferences_to_add == [
-        "故事冲突保持生活化",
-    ]
-
-
-def test_existing_scoped_preference_cannot_be_rewritten_as_global(monkeypatch):
-    """
-    已有scoped近义偏好不能通过全局字段重复写入。
-    """
-    existing_preference = "故事大纲聚焦人物关系与故事线推进，弱化具体动作描写"
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            disliked_elements_to_add=[
-                existing_preference,
-            ],
-            additional_preferences_to_add=[
-                existing_preference,
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后大纲别堆太多动作，主要写人物关系和情节发展。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                existing_preference,
-            ],
-        ),
-    )
-
-    assert result.should_update is False
-    assert result.disliked_elements_to_add == []
-    assert result.additional_preferences_to_add == []
-
-
-def test_explicit_global_preference_can_enter_global_field(monkeypatch):
-    """
-    用户明确扩大到所有创作的偏好，仍可进入全局字段。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            disliked_elements_to_add=[
-                "所有创作减少大量旁白",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后所有创作都不要大量旁白。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                "故事大纲减少解释性文字",
-            ],
-        ),
     )
 
     assert result.should_update is True
     assert result.disliked_elements_to_add == [
-        "所有创作减少大量旁白",
+        "大团圆结局",
     ]
 
 
-def test_scope_example_semantic_duplicate_becomes_no_update(monkeypatch):
+def test_one_time_request_rejected_by_conservative_verifier(monkeypatch):
     """
-    M6.1示例属于story scoped语义重复，没有其他增量时不更新。
+    一次性创作需求即使形成候选，也会被Verifier拒绝，避免写入长期Memory。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    duration = _candidate(
+        "preferred_duration_sec",
+        "20",
+        "user_idea",
+        "20秒",
+        "task_constraint",
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+    campus = _candidate(
+        "preferred_genres_to_add",
+        "校园片",
+        "user_idea",
+        "校园晨跑短片",
+        "inferred_preference",
     )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后大纲别堆太多动作，主要写人物关系和情节发展。",
-        current_memory=UserMemory(
-            user_id="demo_user",
-            story_preferences=[
-                "故事大纲聚焦人物关系与故事线推进，弱化具体动作描写",
-            ],
-        ),
+    self_encouragement = _candidate(
+        "story_preferences_to_add",
+        "自我鼓励",
+        "user_idea",
+        "自我鼓励",
+        "inferred_preference",
     )
-
-    prompt = fake_llm.prompts[-1]
-
-    assert result.should_update is False
-    assert result.story_preferences_to_add == []
-    assert result.disliked_elements_to_add == []
-    assert "以后大纲别堆太多动作，主要写人物关系和情节发展" in prompt
-    _assert_prompt_has_keywords(
-        prompt,
+    _patch_memory_pipeline(
+        monkeypatch,
         [
-            "故事",
-            "大纲",
-            "story_preferences_to_add",
-            "disliked_elements_to_add",
-            "整体创作",
-            "对应字段",
-            "含义相同",
+            duration,
+            campus,
+            self_encouragement,
+        ],
+        [
+            _decision(duration, "REJECT"),
+            _decision(campus, "REJECT"),
+            _decision(self_encouragement, "REJECT"),
         ],
     )
 
-
-def test_current_task_specific_feedback_is_not_saved(monkeypatch):
-    """
-    绑定当前人物、地点或剧情的修改不应写入长期Memory。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    result = extract_memory_module.extract_memory_update(
+        user_idea="这次生成一个20秒的校园晨跑短片，主角在操场完成一次小小的自我鼓励。",
+        current_memory=_current_memory(),
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+
+    _assert_no_increment(result)
+
+
+def test_mixed_task_and_preference_only_saves_explicit_preference(monkeypatch):
+    """
+    本次题材选择不应变成偏好；同一句里的明确厌恶可以保存。
+    """
+    campus = _candidate(
+        "preferred_genres_to_add",
+        "校园片",
+        "user_idea",
+        "这次写一个校园片",
+        "task_constraint",
+    )
+    dislike = _candidate(
+        "disliked_elements_to_add",
+        "大团圆结局",
+        "user_idea",
+        "我讨厌大团圆结局",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [
+            campus,
+            dislike,
+        ],
+        [
+            _decision(campus, "REJECT"),
+            _decision(dislike, "ACCEPT"),
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="这次写一个校园片，我讨厌大团圆结局。",
+        current_memory=_current_memory(),
+    )
+
+    assert result.preferred_genres_to_add == []
+    assert result.disliked_elements_to_add == [
+        "大团圆结局",
+    ]
+
+
+def test_current_story_scene_feedback_is_rejected(monkeypatch):
+    """
+    只能解释为当前分场修改的HITL反馈，不应提升为长期Memory。
+    """
+    candidate = _candidate(
+        "scene_preferences_to_add",
+        "减少场景动作",
+        "human_feedback",
+        "第三场动作太多了，把争吵删掉一些",
+        "task_constraint",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
+        [
+            _decision(
+                candidate,
+                "REJECT",
+            )
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="这次生成一个校园故事。",
+        current_memory=_current_memory(),
+        human_feedback_history=[
+            {
+                "scope": "scene",
+                "decision": "revise",
+                "feedback": "第三场动作太多了，把争吵删掉一些。",
+            }
+        ],
+    )
+
+    _assert_no_increment(result)
+
+
+def test_long_term_story_feedback_can_be_saved(monkeypatch):
+    """
+    明确长期的story反馈可以写入story_preferences。
+    """
+    candidate = _candidate(
+        "story_preferences_to_add",
+        "故事大纲少写具体动作，关注人物关系",
+        "human_feedback",
+        "以后故事大纲少写具体动作，我更关注人物关系",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
+        [
+            _decision(
+                candidate,
+                "ACCEPT",
+            )
+        ],
     )
 
     result = extract_memory_module.extract_memory_update(
@@ -618,42 +419,60 @@ def test_current_task_specific_feedback_is_not_saved(monkeypatch):
             {
                 "scope": "story",
                 "decision": "revise",
-                "feedback": "把林夏改成在图书馆遇到陈屿。",
+                "feedback": "以后故事大纲少写具体动作，我更关注人物关系。",
             }
         ],
     )
 
-    assert result.should_update is False
-    assert result.story_preferences_to_add == []
-    _assert_prompt_has_keywords(
-        fake_llm.prompts[-1],
+    assert result.story_preferences_to_add == [
+        "故事大纲少写具体动作，关注人物关系",
+    ]
+    assert result.scene_preferences_to_add == []
+
+
+def test_missing_evidence_is_rejected_before_verifier(monkeypatch):
+    """
+    evidence不存在于对应原文时，代码层直接拒绝，Verifier不会被调用。
+    """
+    candidate = _candidate(
+        "style_preferences_to_add",
+        "克制表达",
+        "user_idea",
+        "不存在的证据",
+    )
+    fake_candidate_llm, fake_verifier_llm = _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
         [
-            "当前人物",
-            "地点",
-            "场次",
-            "具体剧情",
-            "任务专属要求不保存",
+            _decision(
+                candidate,
+                "ACCEPT",
+            )
         ],
     )
 
-
-def test_approve_without_feedback_does_not_add_feedback_to_prompt(monkeypatch):
-    """
-    approve且无文字反馈时，不应产生可提取的人工反馈。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    result = extract_memory_module.extract_memory_update(
+        user_idea="我讨厌大团圆结局。",
+        current_memory=_current_memory(),
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+
+    _assert_no_increment(result)
+    assert len(fake_candidate_llm.prompts) == 1
+    assert fake_verifier_llm.prompts == []
+
+
+def test_blank_input_and_no_feedback_skips_all_llm(monkeypatch):
+    """
+    没有用户输入且没有有效人工反馈时，基础输入保护直接跳过。
+    """
+    fake_candidate_llm, fake_verifier_llm = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
     )
 
     result = extract_memory_module.extract_memory_update(
-        user_idea="再生成一个校园故事。",
+        user_idea="   ",
         current_memory=_current_memory(),
         human_feedback_history=[
             {
@@ -664,124 +483,20 @@ def test_approve_without_feedback_does_not_add_feedback_to_prompt(monkeypatch):
         ],
     )
 
-    assert result.should_update is False
-    assert "无人工反馈" in fake_llm.prompts[-1]
-
-
-def test_story_and_scene_scopes_are_not_mixed(monkeypatch):
-    """
-    story和scene反馈应分别受各自字段约束。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            story_preferences_to_add=[
-                "故事冲突保持内敛",
-            ],
-            scene_preferences_to_add=[
-                "分场减少解释性对白",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=_current_memory(),
-        human_feedback_history=[
-            {
-                "scope": "story",
-                "decision": "revise",
-                "feedback": "以后故事冲突保持内敛。",
-            },
-            {
-                "scope": "scene",
-                "decision": "revise",
-                "feedback": "以后分场减少解释性对白。",
-            },
-        ],
-    )
-
-    prompt = fake_llm.prompts[-1]
-
-    assert result.story_preferences_to_add == [
-        "故事冲突保持内敛",
-    ]
-    assert result.scene_preferences_to_add == [
-        "分场减少解释性对白",
-    ]
-    _assert_prompt_has_keywords(
-        prompt,
-        [
-            "故事",
-            "大纲",
-            "剧情结构",
-            "story_preferences_to_add",
-            "分场",
-            "场景",
-            "场景动作",
-            "scene_preferences_to_add",
-        ],
-    )
-
-
-def test_user_idea_extraction_still_works_without_human_feedback(monkeypatch):
-    """
-    没有人工反馈时，仍保留从用户输入提取长期偏好的能力。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            style_preferences_to_add=[
-                "现实主义",
-                "克制表达",
-            ],
-            disliked_elements_to_add=[
-                "大量旁白",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后帮我生成短片时，请保持现实主义和克制表达，不要使用大量旁白。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is True
-    assert result.style_preferences_to_add == [
-        "现实主义",
-        "克制表达",
-    ]
-    assert result.disliked_elements_to_add == [
-        "大量旁白",
-    ]
-    assert "无人工反馈" in fake_llm.prompts[-1]
+    _assert_no_increment(result)
+    assert fake_candidate_llm.prompts == []
+    assert fake_verifier_llm.prompts == []
 
 
 def test_only_recent_eight_non_empty_feedback_items_are_used(monkeypatch):
     """
-    人工反馈超过8条时，只把最近8条非空用户反馈放入Prompt。
+    人工反馈超过8条时，只把最近8条非空用户反馈放入候选Prompt。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    fake_candidate_llm, _ = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
     feedback_history = [
         {
             "scope": "story",
@@ -805,7 +520,7 @@ def test_only_recent_eight_non_empty_feedback_items_are_used(monkeypatch):
         human_feedback_history=feedback_history,
     )
 
-    prompt = fake_llm.prompts[-1]
+    prompt = fake_candidate_llm.prompts[-1]
 
     assert "长期反馈0" not in prompt
     assert "长期反馈1" not in prompt
@@ -816,17 +531,12 @@ def test_only_recent_eight_non_empty_feedback_items_are_used(monkeypatch):
 
 def test_approve_with_text_feedback_is_kept(monkeypatch):
     """
-    approve如果带有文字反馈，仍应保留给提取器判断。
+    approve如果带有文字反馈，仍应保留给候选提取器判断。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
+    fake_candidate_llm, _ = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
     )
 
     extract_memory_module.extract_memory_update(
@@ -841,27 +551,21 @@ def test_approve_with_text_feedback_is_kept(monkeypatch):
         ],
     )
 
-    prompt = fake_llm.prompts[-1]
+    prompt = fake_candidate_llm.prompts[-1]
 
     assert '"decision": "approve"' in prompt
     assert "以后也保持这种克制结尾" in prompt
 
 
-def test_prompt_does_not_include_machine_review_or_final_output(monkeypatch):
+def test_machine_review_and_final_output_do_not_enter_prompt(monkeypatch):
     """
-    Prompt只应包含用户反馈字段，不应混入机器Review或最终输出。
+    Prompt只应包含用户输入和用户反馈字段，不应混入机器Review或最终输出。
     """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-        )
+    fake_candidate_llm, _ = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
     )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
     machine_review_sentinel = "SENTINEL_MACHINE_REVIEW_CONTENT"
     final_output_sentinel = "SENTINEL_FINAL_OUTPUT_CONTENT"
 
@@ -879,7 +583,7 @@ def test_prompt_does_not_include_machine_review_or_final_output(monkeypatch):
         ],
     )
 
-    prompt = fake_llm.prompts[-1]
+    prompt = fake_candidate_llm.prompts[-1]
 
     assert "以后故事结尾更克制" in prompt
     assert machine_review_sentinel not in prompt
@@ -887,11 +591,331 @@ def test_prompt_does_not_include_machine_review_or_final_output(monkeypatch):
     _assert_prompt_has_keywords(
         prompt,
         [
-            "不依据",
             "机器 Review",
             "final_output",
         ],
     )
+
+
+def test_story_and_scene_scopes_are_not_mixed(monkeypatch):
+    """
+    story和scene反馈应分别进入各自字段。
+    """
+    story_candidate = _candidate(
+        "story_preferences_to_add",
+        "故事冲突保持内敛",
+        "human_feedback",
+        "以后故事冲突保持内敛",
+    )
+    scene_candidate = _candidate(
+        "scene_preferences_to_add",
+        "分场减少解释性对白",
+        "human_feedback",
+        "以后分场减少解释性对白",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [
+            story_candidate,
+            scene_candidate,
+        ],
+        [
+            _decision(story_candidate, "ACCEPT"),
+            _decision(scene_candidate, "ACCEPT"),
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="这次生成一个校园故事。",
+        current_memory=_current_memory(),
+        human_feedback_history=[
+            {
+                "scope": "story",
+                "decision": "revise",
+                "feedback": "以后故事冲突保持内敛。",
+            },
+            {
+                "scope": "scene",
+                "decision": "revise",
+                "feedback": "以后分场减少解释性对白。",
+            },
+        ],
+    )
+
+    assert result.story_preferences_to_add == [
+        "故事冲突保持内敛",
+    ]
+    assert result.scene_preferences_to_add == [
+        "分场减少解释性对白",
+    ]
+
+
+def test_scoped_preference_is_not_also_global_after_conversion(monkeypatch):
+    """
+    Scoped候选和全局候选同文本时，最终只保留Scoped字段。
+    """
+    story_candidate = _candidate(
+        "story_preferences_to_add",
+        "故事结尾保持克制开放",
+        "user_idea",
+        "以后故事结尾保持克制开放",
+    )
+    global_candidate = _candidate(
+        "additional_preferences_to_add",
+        "故事结尾保持克制开放",
+        "user_idea",
+        "以后故事结尾保持克制开放",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [
+            story_candidate,
+            global_candidate,
+        ],
+        [
+            _decision(story_candidate, "ACCEPT"),
+            _decision(global_candidate, "ACCEPT"),
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="以后故事结尾保持克制开放。",
+        current_memory=_current_memory(),
+    )
+
+    assert result.story_preferences_to_add == [
+        "故事结尾保持克制开放",
+    ]
+    assert result.additional_preferences_to_add == []
+
+
+def test_scene_scoped_preference_is_not_also_global_after_conversion(
+    monkeypatch,
+):
+    """
+    Scene候选与全局候选同文本时，最终只保留Scene作用域字段。
+    """
+    scene_candidate = _candidate(
+        "scene_preferences_to_add",
+        "分场动作保持具体可拍摄",
+        "user_idea",
+        "以后分场动作保持具体可拍摄",
+    )
+    global_candidate = _candidate(
+        "additional_preferences_to_add",
+        "分场动作保持具体可拍摄",
+        "user_idea",
+        "以后分场动作保持具体可拍摄",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [
+            scene_candidate,
+            global_candidate,
+        ],
+        [
+            _decision(scene_candidate, "ACCEPT"),
+            _decision(global_candidate, "ACCEPT"),
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="以后分场动作保持具体可拍摄。",
+        current_memory=_current_memory(),
+    )
+
+    assert result.scene_preferences_to_add == [
+        "分场动作保持具体可拍摄",
+    ]
+    assert result.additional_preferences_to_add == []
+
+
+def test_existing_scoped_preference_duplicate_becomes_no_update(monkeypatch):
+    """
+    候选与已有Scoped Memory同文本时，normalize后没有真实增量。
+    """
+    candidate = _candidate(
+        "additional_preferences_to_add",
+        "故事大纲聚焦人物关系与故事线推进，弱化具体动作描写",
+        "user_idea",
+        "以后大纲别堆太多动作",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
+        [
+            _decision(
+                candidate,
+                "ACCEPT",
+            )
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="以后大纲别堆太多动作，主要写人物关系和情节发展。",
+        current_memory=UserMemory(
+            user_id="demo_user",
+            story_preferences=[
+                "故事大纲聚焦人物关系与故事线推进，弱化具体动作描写",
+            ],
+        ),
+    )
+
+    _assert_no_increment(result)
+
+
+def test_should_update_false_clears_leftover_increments():
+    """
+    即使上游返回残留字段，should_update=False也必须归一化为空增量。
+    """
+    result = extract_memory_module._normalize_memory_update(
+        MemoryUpdate(
+            should_update=False,
+            style_preferences_to_add=[
+                "残留风格",
+            ],
+            story_preferences_to_add=[
+                "残留故事偏好",
+            ],
+            preferred_duration_sec=60,
+        ),
+        _current_memory(),
+    )
+
+    _assert_no_increment(result)
+
+
+def test_should_update_true_without_increments_becomes_false():
+    """
+    should_update=True但没有真实增量时，应校正为无需更新。
+    """
+    result = extract_memory_module._normalize_memory_update(
+        MemoryUpdate(
+            should_update=True,
+        ),
+        _current_memory(),
+    )
+
+    _assert_no_increment(result)
+
+
+def test_story_and_scene_same_preference_remain_independent():
+    """
+    Story与Scene作用域独立，相同文本不能跨作用域互相删除。
+    """
+    result = extract_memory_module._normalize_memory_update(
+        MemoryUpdate(
+            should_update=True,
+            story_preferences_to_add=[
+                "表达保持克制",
+            ],
+            scene_preferences_to_add=[
+                "表达保持克制",
+            ],
+        ),
+        _current_memory(),
+    )
+
+    assert result.should_update is True
+    assert result.story_preferences_to_add == [
+        "表达保持克制",
+    ]
+    assert result.scene_preferences_to_add == [
+        "表达保持克制",
+    ]
+
+
+def test_approve_without_feedback_is_filtered_from_candidate_prompt(monkeypatch):
+    """
+    即使user_idea非空，无文字approve也不应成为候选提取上下文。
+    """
+    fake_candidate_llm, _ = _patch_memory_pipeline(
+        monkeypatch,
+        [],
+        [],
+    )
+
+    extract_memory_module.extract_memory_update(
+        user_idea="这次生成一个校园故事。",
+        current_memory=_current_memory(),
+        human_feedback_history=[
+            {
+                "scope": "story",
+                "decision": "approve",
+                "feedback": None,
+            }
+        ],
+    )
+
+    prompt = fake_candidate_llm.prompts[-1]
+
+    assert "无人工反馈" in prompt
+    assert '"decision": "approve"' not in prompt
+
+
+def test_duration_candidate_can_be_converted(monkeypatch):
+    """
+    Verifier接受长期时长候选后，会转换为preferred_duration_sec。
+    """
+    candidate = _candidate(
+        "preferred_duration_sec",
+        "60秒",
+        "user_idea",
+        "以后生成的短片默认控制在60秒",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [candidate],
+        [
+            _decision(
+                candidate,
+                "ACCEPT",
+            )
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="以后生成的短片默认控制在60秒。",
+        current_memory=_current_memory(),
+    )
+
+    assert result.should_update is True
+    assert result.preferred_duration_sec == 60
+
+
+def test_verifier_cannot_accept_invented_candidate(monkeypatch):
+    """
+    Verifier如果返回未经过证据校验的候选，代码层不会接受。
+    """
+    original_candidate = _candidate(
+        "disliked_elements_to_add",
+        "大团圆结局",
+        "user_idea",
+        "我讨厌大团圆结局",
+    )
+    invented_candidate = _candidate(
+        "style_preferences_to_add",
+        "现实主义",
+        "user_idea",
+        "我讨厌大团圆结局",
+    )
+    _patch_memory_pipeline(
+        monkeypatch,
+        [original_candidate],
+        [
+            _decision(
+                invented_candidate,
+                "ACCEPT",
+            )
+        ],
+    )
+
+    result = extract_memory_module.extract_memory_update(
+        user_idea="我讨厌大团圆结局。",
+        current_memory=_current_memory(),
+    )
+
+    _assert_no_increment(result)
 
 
 def test_update_memory_passes_human_feedback_history_to_extractor(monkeypatch):
@@ -900,7 +924,7 @@ def test_update_memory_passes_human_feedback_history_to_extractor(monkeypatch):
     """
     captured_args = {}
     current_memory = _current_memory()
-    memory_update = MemoryUpdate(
+    memory_update = extract_memory_module.MemoryUpdate(
         should_update=False,
     )
 
@@ -947,91 +971,4 @@ def test_update_memory_passes_human_feedback_history_to_extractor(monkeypatch):
             "decision": "revise",
             "feedback": "以后结尾更克制。",
         }
-    ]
-
-
-def test_should_update_false_clears_leftover_increments(monkeypatch):
-    """
-    LLM返回should_update=False时，残留增量字段应被代码清空。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=False,
-            style_preferences_to_add=[
-                "残留风格",
-            ],
-            story_preferences_to_add=[
-                "残留故事偏好",
-            ],
-            preferred_duration_sec=60,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is False
-    assert result.style_preferences_to_add == []
-    assert result.story_preferences_to_add == []
-    assert result.preferred_duration_sec is None
-
-
-def test_should_update_true_without_increments_becomes_false(monkeypatch):
-    """
-    LLM返回should_update=True但没有任何增量时，应自动改为False。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="这次生成一个校园故事。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is False
-    assert result.preferred_genres_to_add == []
-    assert result.preferred_duration_sec is None
-
-
-def test_valid_increment_is_not_removed(monkeypatch):
-    """
-    合法非空增量不应被输出校正误删。
-    """
-    fake_llm = FakeMemoryUpdateLLM(
-        MemoryUpdate(
-            should_update=True,
-            scene_preferences_to_add=[
-                "分场动作更具体",
-            ],
-        )
-    )
-    monkeypatch.setattr(
-        extract_memory_module,
-        "memory_update_llm",
-        fake_llm,
-    )
-
-    result = extract_memory_module.extract_memory_update(
-        user_idea="以后分场动作更具体。",
-        current_memory=_current_memory(),
-    )
-
-    assert result.should_update is True
-    assert result.scene_preferences_to_add == [
-        "分场动作更具体",
     ]

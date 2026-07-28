@@ -13,6 +13,7 @@ from app.schemas import (
 )
 from app.sse import format_sse_event
 from graph import film_graph, film_hitl_graph
+from observability.summarize import build_execution_summary
 from state import FilmState
 
 
@@ -60,18 +61,193 @@ def _extract_interrupt_payload(
     return interrupt_event
 
 
+def _build_summary_state(
+    execution_id: str,
+    current_stage: str = "initialized",
+) -> dict:
+    """
+    构造用于流式接口渐进累积的Summary State。
+
+    SSE只能逐步拿到节点局部更新，因此需要在API层保留一份轻量State，
+    供终态事件构建execution_summary。
+    """
+    return {
+        "execution_id": execution_id,
+        "current_stage": current_stage,
+        "execution_trace": [],
+        "llm_call_trace": [],
+    }
+
+
+def _merge_node_update_for_summary(
+    summary_state: dict,
+    node_update: dict,
+) -> None:
+    """
+    将LangGraph stream中的单个节点局部更新累积到Summary State。
+    """
+    if "current_stage" in node_update:
+        summary_state["current_stage"] = node_update[
+            "current_stage"
+        ]
+
+    if "memory_update_status" in node_update:
+        summary_state["memory_update_status"] = node_update[
+            "memory_update_status"
+        ]
+
+    for history_key in (
+        "story_review_history",
+        "scene_review_history",
+        "human_feedback_history",
+    ):
+        if history_key in node_update:
+            summary_state.setdefault(
+                history_key,
+                [],
+            ).extend(
+                node_update.get(history_key) or []
+            )
+
+    if "story_revision_count" in node_update:
+        summary_state["story_revision_count"] = node_update[
+            "story_revision_count"
+        ]
+
+    if "scene_revision_count" in node_update:
+        summary_state["scene_revision_count"] = node_update[
+            "scene_revision_count"
+        ]
+
+    summary_state.setdefault(
+        "execution_trace",
+        [],
+    ).extend(
+        node_update.get("execution_trace", [])
+    )
+
+    # LLM调用明细只在服务端渐进State中累计，SSE仅在终态发送轻量Summary。
+    summary_state.setdefault(
+        "llm_call_trace",
+        [],
+    ).extend(
+        node_update.get("llm_call_trace", [])
+    )
+
+
+def _checkpoint_state_values(
+    graph,
+    config: dict,
+) -> dict:
+    """
+    尽量读取Checkpointer中的完整State。
+
+    Summary是观测信息，读取失败时不能覆盖原Graph异常或中断流程，
+    因此这里保守返回空dict。
+    """
+    try:
+        graph_state = graph.get_state(
+            config
+        )
+    except Exception:
+        logger.exception(
+            "读取Graph checkpoint用于Summary失败。"
+        )
+        return {}
+
+    return graph_state.values or {}
+
+
+def _summary_payload(
+    state: dict,
+    status: str,
+    error: Exception | None = None,
+    public_error_message: str | None = None,
+) -> dict:
+    """
+    构建可JSON序列化的execution_summary字典。
+    """
+    execution_summary = build_execution_summary(
+        state,
+        status,
+        error=error,
+    )
+
+    if public_error_message is not None:
+        # 对外API/SSE保留异常类型，但错误消息使用安全文案，避免泄露原始异常细节。
+        execution_summary.error_message = public_error_message
+
+    return execution_summary.model_dump(
+        mode="json"
+    )
+
+
+def _normalize_summary_state(
+    state: dict,
+    execution_id: str,
+    current_stage: str = "initialized",
+) -> dict:
+    """
+    给用于Summary的State补齐最基础的执行身份字段。
+
+    真实FilmState通常已经包含这些字段；测试fake或旧checkpoint可能缺失，
+    这里补齐后再汇总，避免Summary里execution_id为空。
+    """
+    normalized_state = {
+        **state,
+    }
+    normalized_state.setdefault(
+        "execution_id",
+        execution_id,
+    )
+    normalized_state.setdefault(
+        "current_stage",
+        current_stage,
+    )
+    normalized_state.setdefault(
+        "execution_trace",
+        [],
+    )
+    normalized_state.setdefault(
+        "llm_call_trace",
+        [],
+    )
+
+    return normalized_state
+
+
 def _run_hitl_graph_until_pause_or_end(
     graph_input,
     config: dict,
     execution_id: str,
+    existing_state: dict | None = None,
 ) -> HitlFilmResponse:
     """
     运行HITL Graph，直到暂停等待人工或完整结束。
+
+    Resume时从暂停Checkpoint的完整State开始累计，避免只返回恢复阶段增量。
     """
     final_output = None
-    current_stage = "initialized"
-    memory_update_status = None
-    execution_trace = []
+    summary_state = _normalize_summary_state(
+        existing_state
+        or _build_summary_state(
+            execution_id
+        ),
+        execution_id,
+    )
+    current_stage = summary_state.get(
+        "current_stage",
+        "initialized",
+    )
+    memory_update_status = summary_state.get(
+        "memory_update_status"
+    )
+    execution_trace = list(
+        summary_state.get(
+            "execution_trace",
+            [],
+        )
+    )
 
     for event in film_hitl_graph.stream(
         graph_input,
@@ -87,22 +263,31 @@ def _run_hitl_graph_until_pause_or_end(
                 config
             )
             state_values = graph_state.values or {}
+            summary_source = _normalize_summary_state(
+                state_values or summary_state,
+                execution_id,
+                current_stage,
+            )
 
             return HitlFilmResponse(
                 execution_id=execution_id,
                 status="waiting_for_human",
-                current_stage=state_values.get(
+                current_stage=summary_source.get(
                     "current_stage",
                     current_stage,
                 ),
                 review_payload=interrupt_payload,
-                execution_trace=state_values.get(
+                execution_trace=summary_source.get(
                     "execution_trace",
                     execution_trace,
                 ),
-                memory_update_status=state_values.get(
+                memory_update_status=summary_source.get(
                     "memory_update_status",
                     memory_update_status,
+                ),
+                execution_summary=build_execution_summary(
+                    summary_source,
+                    "waiting_for_human",
                 ),
             )
 
@@ -129,26 +314,61 @@ def _run_hitl_graph_until_pause_or_end(
                     [],
                 )
             )
+            _merge_node_update_for_summary(
+                summary_state,
+                node_update,
+            )
 
     if final_output is None:
         raise RuntimeError(
             "HITL Graph执行结束后缺少final_output。"
         )
 
+    checkpoint_values = _checkpoint_state_values(
+        film_hitl_graph,
+        config,
+    )
+    summary_source = (
+        checkpoint_values
+        if checkpoint_values.get("final_output") is not None
+        else summary_state
+    )
+    summary_source = _normalize_summary_state(
+        summary_source,
+        execution_id,
+        current_stage,
+    )
+
     return HitlFilmResponse(
         execution_id=execution_id,
         status="completed",
-        current_stage=current_stage,
-        final_output=final_output,
-        execution_trace=execution_trace,
-        memory_update_status=memory_update_status,
+        current_stage=summary_source.get(
+            "current_stage",
+            current_stage,
+        ),
+        final_output=summary_source.get(
+            "final_output",
+            final_output,
+        ),
+        execution_trace=summary_source.get(
+            "execution_trace",
+            execution_trace,
+        ),
+        memory_update_status=summary_source.get(
+            "memory_update_status",
+            memory_update_status,
+        ),
+        execution_summary=build_execution_summary(
+            summary_source,
+            "completed",
+        ),
     )
 
 
 def _ensure_hitl_checkpoint_waiting(
     execution_id: str,
     config: dict,
-) -> None:
+) -> dict:
     """
     检查指定execution_id是否存在可恢复的人工审核checkpoint。
 
@@ -176,6 +396,9 @@ def _ensure_hitl_checkpoint_waiting(
                 "message": "当前执行没有待处理的人工审核。",
             },
         )
+
+    # Resume响应需要以暂停前完整State为起点，后续再追加本次恢复产生的更新。
+    return graph_state.values or {}
 
 
 @app.get("/health")
@@ -245,9 +468,17 @@ def generate_film(
             memory_update_status=final_state.get(
                 "memory_update_status"
             ),
+            execution_summary=build_execution_summary(
+                final_state,
+                "completed",
+            ),
         )
 
-    except Exception:
+    except Exception as exc:
+        error_state = locals().get(
+            "initial_state",
+            _build_summary_state(execution_id),
+        )
         logger.exception(
             "Film Graph执行失败，execution_id=%s",
             execution_id,
@@ -257,6 +488,12 @@ def generate_film(
             detail={
                 "execution_id": execution_id,
                 "message": "Film Graph执行失败。",
+                "execution_summary": _summary_payload(
+                    error_state,
+                    "failed",
+                    error=exc,
+                    public_error_message="Film Graph执行失败。",
+                ),
             },
         )
 
@@ -295,7 +532,7 @@ def start_hitl_film(
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "HITL Graph启动失败，execution_id=%s",
             execution_id,
@@ -305,6 +542,12 @@ def start_hitl_film(
             detail={
                 "execution_id": execution_id,
                 "message": "HITL Graph执行失败。",
+                "execution_summary": _summary_payload(
+                    initial_state,
+                    "failed",
+                    error=exc,
+                    public_error_message="HITL Graph执行失败。",
+                ),
             },
         )
 
@@ -325,7 +568,7 @@ def resume_hitl_film(
     )
 
     try:
-        _ensure_hitl_checkpoint_waiting(
+        existing_state = _ensure_hitl_checkpoint_waiting(
             execution_id,
             config,
         )
@@ -339,11 +582,18 @@ def resume_hitl_film(
             ),
             config,
             execution_id,
+            existing_state=existing_state,
         )
 
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
+        error_state = _checkpoint_state_values(
+            film_hitl_graph,
+            config,
+        ) or _build_summary_state(
+            execution_id
+        )
         logger.exception(
             "HITL Graph恢复失败，execution_id=%s",
             execution_id,
@@ -353,6 +603,12 @@ def resume_hitl_film(
             detail={
                 "execution_id": execution_id,
                 "message": "HITL Graph执行失败。",
+                "execution_summary": _summary_payload(
+                    error_state,
+                    "failed",
+                    error=exc,
+                    public_error_message="HITL Graph执行失败。",
+                ),
             },
         )
 
@@ -388,6 +644,12 @@ def stream_start_hitl_film(
         current_stage = "initialized"
         memory_update_status = None
         execution_trace = []
+        summary_state = _build_summary_state(
+            execution_id
+        )
+        summary_state = _build_summary_state(
+            execution_id
+        )
 
         try:
             yield format_sse_event(
@@ -416,6 +678,17 @@ def stream_start_hitl_film(
                             "execution_id": execution_id,
                             "status": "waiting_for_human",
                             "review_payload": interrupt_payload,
+                            "execution_summary": _summary_payload(
+                                _normalize_summary_state(
+                                    _checkpoint_state_values(
+                                        film_hitl_graph,
+                                        config,
+                                    ) or summary_state,
+                                    execution_id,
+                                    current_stage,
+                                ),
+                                "waiting_for_human",
+                            ),
                         },
                     )
                     return
@@ -436,6 +709,11 @@ def stream_start_hitl_film(
                         memory_update_status = node_update[
                             "memory_update_status"
                         ]
+
+                    _merge_node_update_for_summary(
+                        summary_state,
+                        node_update,
+                    )
 
                     new_trace_events = node_update.get(
                         "execution_trace",
@@ -480,10 +758,18 @@ def stream_start_hitl_film(
                     "final_output": final_output,
                     "execution_trace": execution_trace,
                     "memory_update_status": memory_update_status,
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            summary_state,
+                            execution_id,
+                            current_stage,
+                        ),
+                        "completed",
+                    ),
                 },
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "HITL Graph流式启动失败，execution_id=%s",
                 execution_id,
@@ -494,6 +780,16 @@ def stream_start_hitl_film(
                     "execution_id": execution_id,
                     "status": "failed",
                     "message": "Film Graph执行失败。",
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            summary_state,
+                            execution_id,
+                            current_stage,
+                        ),
+                        "failed",
+                        error=exc,
+                        public_error_message="Film Graph执行失败。",
+                    ),
                 },
             )
 
@@ -530,6 +826,19 @@ def stream_resume_hitl_film(
         """
         使用同一thread_id恢复HITL Graph，并持续输出节点级SSE事件。
         """
+        checkpoint_values = _checkpoint_state_values(
+            film_hitl_graph,
+            config,
+        )
+        summary_state = _normalize_summary_state(
+            checkpoint_values or _build_summary_state(execution_id),
+            execution_id,
+            checkpoint_values.get(
+                "current_stage",
+                "initialized",
+            ),
+        )
+
         try:
             yield format_sse_event(
                 "resumed",
@@ -556,12 +865,32 @@ def stream_resume_hitl_film(
 
                 if interrupt_payload is not None:
                     # revise后可能再次暂停；checkpoint已保存，后续继续由独立resume请求提交。
+                    checkpoint_values = _checkpoint_state_values(
+                        film_hitl_graph,
+                        config,
+                    )
+                    summary_source = (
+                        checkpoint_values
+                        if checkpoint_values.get("execution_trace")
+                        else summary_state
+                    )
                     yield format_sse_event(
                         "human_review_required",
                         {
                             "execution_id": execution_id,
                             "status": "waiting_for_human",
                             "review_payload": interrupt_payload,
+                            "execution_summary": _summary_payload(
+                                _normalize_summary_state(
+                                    summary_source,
+                                    execution_id,
+                                    summary_state.get(
+                                        "current_stage",
+                                        "initialized",
+                                    ),
+                                ),
+                                "waiting_for_human",
+                            ),
                         },
                     )
                     return
@@ -573,6 +902,10 @@ def stream_resume_hitl_film(
                     new_trace_events = node_update.get(
                         "execution_trace",
                         [],
+                    )
+                    _merge_node_update_for_summary(
+                        summary_state,
+                        node_update,
                     )
 
                     for trace_event in new_trace_events:
@@ -627,10 +960,21 @@ def stream_resume_hitl_film(
                     "memory_update_status": final_state.get(
                         "memory_update_status"
                     ),
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            final_state,
+                            execution_id,
+                            final_state.get(
+                                "current_stage",
+                                "unknown",
+                            ),
+                        ),
+                        "completed",
+                    ),
                 },
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "HITL Graph流式恢复失败，execution_id=%s",
                 execution_id,
@@ -641,6 +985,19 @@ def stream_resume_hitl_film(
                     "execution_id": execution_id,
                     "status": "failed",
                     "message": "Film Graph执行失败。",
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            summary_state,
+                            execution_id,
+                            summary_state.get(
+                                "current_stage",
+                                "initialized",
+                            ),
+                        ),
+                        "failed",
+                        error=exc,
+                        public_error_message="Film Graph执行失败。",
+                    ),
                 },
             )
 
@@ -688,6 +1045,9 @@ def stream_film(
         current_stage = "initialized"
         memory_update_status = None
         execution_trace = []
+        summary_state = _build_summary_state(
+            execution_id
+        )
 
         try:
             yield format_sse_event(
@@ -719,6 +1079,11 @@ def stream_film(
                         memory_update_status = node_update[
                             "memory_update_status"
                         ]
+
+                    _merge_node_update_for_summary(
+                        summary_state,
+                        node_update,
+                    )
 
                     new_trace_events = node_update.get(
                         "execution_trace",
@@ -765,10 +1130,18 @@ def stream_film(
                     "final_output": final_output,
                     "execution_trace": execution_trace,
                     "memory_update_status": memory_update_status,
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            summary_state,
+                            execution_id,
+                            current_stage,
+                        ),
+                        "completed",
+                    ),
                 },
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Film Graph流式执行失败，execution_id=%s",
                 execution_id,
@@ -781,6 +1154,16 @@ def stream_film(
                     "execution_id": execution_id,
                     "status": "failed",
                     "message": "Film Graph执行失败。",
+                    "execution_summary": _summary_payload(
+                        _normalize_summary_state(
+                            summary_state,
+                            execution_id,
+                            current_stage,
+                        ),
+                        "failed",
+                        error=exc,
+                        public_error_message="Film Graph执行失败。",
+                    ),
                 },
             )
 

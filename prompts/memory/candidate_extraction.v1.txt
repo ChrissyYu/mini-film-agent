@@ -1,0 +1,34 @@
+
+你负责从用户文字中提取“可能成为长期Memory”的候选，但你没有写入Memory的权限。
+
+【用户本次输入 source=user_idea】
+{{user_idea}}
+
+【当前长期 Memory】
+{{current_memory_text}}
+
+【有效人工审核反馈 source=human_feedback】
+{{recent_human_feedback_text}}
+
+仅输出符合 MemoryCandidateBatch 结构的数据。
+
+候选规则：
+- 候选必须是长期可复用偏好，或需要被后续Verifier拒绝的可疑主张。
+- evidence必须逐字来自对应source原文，不能改写、概括或生成不存在的证据。
+- claim_type只能是 explicit_preference、task_constraint、inferred_preference。
+- 当前人物、地点、场次、具体剧情、动作和单次时长通常只能作为task_constraint或inferred_preference候选，不能直接当成长期偏好。
+- 不依据机器 Review、模型生成内容或 final_output。
+- 新候选必须与对应字段的已有 Memory 做语义比较；含义相同或高度重合时不要重复输出。
+- 新偏好应规范化为简短、稳定、可跨任务复用的表达，不直接保存整段原话。
+
+作用域与字段：
+- 故事、大纲、叙事和剧情结构偏好，只进入 story_preferences_to_add。
+- 分场、场景、镜头和场景动作偏好，只进入 scene_preferences_to_add。
+- preferred_genres_to_add：长期喜欢的影片类型。
+- style_preferences_to_add：适用于整体创作的长期风格偏好。
+- disliked_elements_to_add：适用于整体创作的长期排斥元素。
+- preferred_duration_sec：仅限长期时长偏好。
+- additional_preferences_to_add：其他长期全局偏好。
+- Scoped候选与全局候选语义重合时，优先保留Scoped候选。
+- 已有Scoped近义偏好时，不得改写到全局字段绕过去重。
+- Story与Scene分别管理，不跨作用域互相删除。

@@ -3,6 +3,7 @@ from typing import Any
 from memory.extract_memory import extract_memory_update    # 从用户输入中提取长期偏好增量
 from memory.merge import merge_user_memory    # 将增量合并到当前完整Memory
 from memory.store import save_user_memory    # 将更新后的完整Memory保存到本地JSON
+from observability.llm_calls import collect_llm_call_trace
 from state import FilmState    # Graph中流转的状态结构
 
 
@@ -17,6 +18,8 @@ def update_memory(
     2. 将增量合并到当前Memory；
     3. 只有确实需要更新时，才保存新的Memory文件。
     """
+    llm_call_events = []
+
     try:
         user_id = state["user_id"]    # 当前用户身份，用于保持更新逻辑显式依赖用户
         user_idea = state["user_idea"]    # 用户本次输入，用于提取长期偏好
@@ -26,11 +29,14 @@ def update_memory(
             [],
         )    # 只把用户人工反馈传给提取器，不混入机器审核或最终生成结果
 
-        update = extract_memory_update(
-            user_idea,
-            current_memory,
-            human_feedback_history,
-        )    # 只提取增量，不保存、不覆盖
+        # Memory节点内部可能依次调用候选提取器和Verifier；
+        # collector只记录真正发生的调用，Verifier被跳过时不会生成事件。
+        with collect_llm_call_trace() as llm_call_events:
+            update = extract_memory_update(
+                user_idea,
+                current_memory,
+                human_feedback_history,
+            )    # 只提取增量，不保存、不覆盖
 
         merged_memory = merge_user_memory(
             current_memory,
@@ -56,6 +62,7 @@ def update_memory(
             "memory_update_status": memory_update_status,    # 本次Memory是否保存
             "memory_update_error": None,    # 成功或跳过时没有错误信息
             "current_stage": "memory_updated",    # 标记Memory更新步骤完成
+            "llm_call_trace": llm_call_events,    # 本节点真实发生的Memory LLM调用
         }
 
     except Exception as exc:
@@ -63,4 +70,5 @@ def update_memory(
             "memory_update_status": "failed",    # Memory更新失败，但不阻断最终影片结果
             "memory_update_error": str(exc),    # 记录失败原因，便于后续排查
             "current_stage": "memory_update_failed",    # 标记Memory更新失败
+            "llm_call_trace": llm_call_events,    # 即使best-effort失败也保留安全调用元数据
         }

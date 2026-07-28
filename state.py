@@ -16,6 +16,19 @@ class TraceEvent(TypedDict):
     duration_ms: float
 
 
+class LLMCallTraceEvent(TypedDict):
+    node: str    # 发起本次LLM调用的Graph节点
+    prompt_name: str    # Prompt Registry中的稳定名称
+    prompt_version: str    # 本次实际使用的Prompt版本
+    prompt_chars: int    # 最终Prompt字符数，不保存Prompt正文
+    llm_profile: str    # Prompt Binding解析出的LLM Profile
+    model_name: str    # LLM Profile中的模型名称
+    temperature: float    # LLM Profile中的temperature
+    status: Literal["success", "failed"]    # 本次真实LLM调用结果
+    duration_ms: float    # 本次LLM调用耗时，单位毫秒
+    error_type: str | None    # 失败时仅记录异常类型，不保存异常正文或堆栈
+
+
 class HumanFeedbackEvent(TypedDict):
     scope: Literal["story", "scene"]    # 人工反馈作用范围
     decision: Literal["approve", "revise"]    # 人工选择：通过或要求修改
@@ -95,6 +108,12 @@ class FilmState(TypedDict, total = False):
         list[TraceEvent],
         operator.add,
     ]     
+
+    # LLM调用跟踪记录与节点Trace分开保存；每次真实调用只追加一条元数据事件。
+    llm_call_trace: Annotated[
+        list[LLMCallTraceEvent],
+        operator.add,
+    ]
 
     # 最终输出
     final_output: dict
